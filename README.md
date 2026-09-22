@@ -6,63 +6,57 @@
 
 支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY` 和 `MOVE`。首次默认账号为 `admin`，默认密码为 `admin123456`；登录部署地址的 `/__admin` 管理页面后可以修改账号密码。修改后的凭证安全哈希存储在 KV 中。
 
-## 一键部署
+## 部署方式（按推荐顺序）
 
-1. Fork 本仓库，默认资源名称为 KV `cf-webdav-kv`、R2 `cf-webdav-files`。
-2. 安装 Node.js 20+，执行 `npm install`，登录：`npx wrangler login`。
-3. 执行 `npm run deploy:setup`。脚本会自动创建或复用默认 KV/R2，并将 Cloudflare 返回的真实 KV namespace ID 写入 `wrangler.toml` 后部署。
-4. 如需自定义资源名称，设置 `WEBDAV_KV_TITLE` 和 `WEBDAV_R2_BUCKET` 环境变量后执行同一命令。
-5. 可选：通过 Secret 覆盖首次启动凭证：
+### 方式一：Cloudflare 控制台创建并绑定资源（首选）
 
-   ```sh
-   npx wrangler secret put ADMIN_USERNAME
-   npx wrangler secret put ADMIN_PASSWORD
-   ```
-
-6. 如果资源已经准备好，也可以直接执行 `npm run deploy`。部署地址通常是 `https://cf-webdav.<你的账号>.workers.dev`。
-
-部署后访问 `https://你的域名/__admin` 登录管理页面。若未配置 Secret，默认登录信息是 `admin / admin123456`，请首次登录后立即修改。
-
-推送到 `main` 或手动运行 `Deploy Worker` 会触发 GitHub Actions。只需在仓库 Settings -> Secrets and variables -> Actions 中添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`，工作流会自动创建或复用默认 KV/R2、回写 namespace ID 并部署。Token 至少需要 Workers 编辑、R2 编辑和 KV 编辑权限；不要将 Token 提交到仓库。
-
-## 通过 Cloudflare 控制台部署
-
-以下流程不需要在本地执行 Wrangler 命令。控制台菜单名称可能会随 Cloudflare 界面更新略有变化。
-
-### 1. 创建 R2 bucket
+此方式最适合首次部署，不需要本地安装 Node.js，也不需要手动填写 KV namespace ID。
 
 1. 登录 Cloudflare Dashboard，选择目标账号。
-2. 打开 **R2 Object Storage**，点击 **Create bucket**。
-3. 输入默认名称 `cf-webdav-files`，位置按实际用户所在地选择，然后创建。
+2. 打开 **Workers & Pages -> Create application**，连接 GitHub 并选择本仓库；如果已经创建了 `cf-webdav` Worker，直接打开它。
+3. 在 Worker 的 **Settings -> Variables and Bindings** 中点击 **Add binding**。
+4. 选择 **R2 Bucket**，Binding name 填写 `WEBDAV_BUCKET`，点击 **Create new bucket**，名称填写 `cf-webdav-files`，创建后选择它。
+5. 再次点击 **Add binding**，选择 **KV Namespace**，Binding name 填写 `WEBDAV_KV`，点击 **Create new namespace**，名称填写 `cf-webdav-kv`，创建后选择它。
+6. 添加普通变量 `DAV_PREFIX`，默认值留空；需要路径前缀时填写例如 `team-files`。
+7. 在 **Secrets** 中按需添加 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`，用于覆盖首次默认账号。
+8. 点击 **Save** 并部署 Worker。
 
-### 2. 创建 KV namespace
+如果控制台没有 **Create new** 按钮，通常是账号或 Token 缺少 R2/KV 编辑权限。可先在 **R2 Object Storage** 创建 `cf-webdav-files`，再在 **Workers & Pages -> KV** 创建 `cf-webdav-kv`，回到绑定页面选择已有资源。
 
-1. 打开 **Workers & Pages -> KV**。
-2. 点击 **Create namespace**，输入默认名称 `cf-webdav-kv`。
-3. 创建后打开该 namespace 的详情，复制 **Namespace ID**。
-4. 在仓库的 [wrangler.toml](wrangler.toml) 中，将 `id = "replace-during-setup"` 替换为复制的真实 ID，并提交到 GitHub。
+### 方式二：Cloudflare 控制台连接 GitHub，并在绑定时创建资源
 
-R2 bucket 名称和 KV namespace ID 属于 Cloudflare 账号级资源，不能使用一个跨账号通用的固定 ID；这是控制台部署中唯一需要从页面复制到配置文件的绑定信息。
+适合希望后续由 GitHub 自动部署的用户。
 
-### 3. 通过 Workers & Pages 连接 GitHub
+1. 在 **Workers & Pages -> Create application** 中连接 GitHub，授权并选择本仓库。
+2. 绑定配置仍使用 `WEBDAV_BUCKET`、`WEBDAV_KV`，资源名称使用默认值 `cf-webdav-files`、`cf-webdav-kv`。
+3. 如果绑定选择框提供 **Create new bucket** 和 **Create new namespace**，直接创建并绑定；否则先按方式一手动创建资源。
+4. 在 GitHub 仓库 **Settings -> Secrets and variables -> Actions** 添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
+5. 推送到 `main` 或手动运行 `Deploy Worker`。工作流会自动检查并复用默认 KV/R2，然后部署 Worker。
 
-1. 打开 **Workers & Pages -> Create application -> Pages -> Connect to Git**，授权并选择本仓库。
-2. 构建设置选择：
-   - Framework preset：`None`
-   - Build command：`npm install && npm run typecheck`
-   - Build output directory：留空
-3. 如果界面提供部署命令，填写 `npx wrangler deploy`；如果使用 Cloudflare 的 Workers Git 集成，则保留其默认 Wrangler 部署流程。
-4. 选择正确的 Cloudflare 账号后点击 **Save and Deploy**。
+### 方式三：本地脚本自动创建 KV/R2
 
-部署完成后，在 **Workers & Pages -> cf-webdav -> Settings -> Variables and Secrets** 检查绑定：
+适合有 Node.js 环境、希望完全自动化部署的用户。默认资源名称为 KV `cf-webdav-kv`、R2 `cf-webdav-files`。
 
-- **R2 Bucket Bindings**：变量名填写 `WEBDAV_BUCKET`，选择 `cf-webdav-files`。
-- **KV Namespace Bindings**：变量名填写 `WEBDAV_KV`，选择 `cf-webdav-kv`。
-- **Environment Variables**：添加 `DAV_PREFIX`，默认值留空；如需路径前缀可填写例如 `team-files`。
+```sh
+npm install
+npx wrangler login
+npm run deploy:setup
+```
 
-在同一页面的 **Secrets** 中可选添加 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`，用于覆盖首次默认账号。保存变量后重新部署一次。
+脚本会自动创建或复用资源，将 Cloudflare 返回的 KV namespace ID 写入 [wrangler.toml](wrangler.toml)，然后部署。也可以通过 `WEBDAV_KV_TITLE` 和 `WEBDAV_R2_BUCKET` 自定义资源名称。
 
-### 4. 登录和验证
+### 方式四：手动 Wrangler 部署
+
+如果资源已在 Cloudflare 控制台创建完成，可将 KV 的真实 Namespace ID 写入 [wrangler.toml](wrangler.toml) 的 `id` 字段，然后执行：
+
+```sh
+npm install
+npm run deploy
+```
+
+不建议首次用户直接使用此方式，因为 KV namespace ID 是账号专属值，不能使用通用固定值。
+
+### 登录和验证
 
 打开 Worker 的 `workers.dev` 地址，访问 `/__admin`：
 
@@ -76,7 +70,7 @@ https://你的-worker.workers.dev/__admin
 curl -u 新用户名:新密码 -X PROPFIND -H 'Depth: 1' https://你的-worker.workers.dev/
 ```
 
-控制台部署不会执行仓库中的 `scripts/setup-resources.mjs`；该脚本仅用于 `npm run deploy:setup` 和 GitHub Actions 自动创建资源。通过控制台部署时，应先按本节手动创建并绑定 R2/KV。
+控制台部署不会执行仓库中的 `scripts/setup-resources.mjs`。控制台流程会直接创建并绑定 R2/KV；`scripts/setup-resources.mjs` 仅用于本地 `npm run deploy:setup` 和 GitHub Actions 自动创建资源。
 
 ## 配置
 
