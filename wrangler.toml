@@ -33,3 +33,7 @@ bucket_name = "cf-webdav-files"
 # DAV_PREFIX：WebDAV 路径前缀，留空表示根路径
 # 例如设置为 "team-files" 后，所有文件会存储在 R2 的 team-files/ 前缀下
 DAV_PREFIX = ""
+
+# ENABLE_ACCESS_LOG：是否启用访问日志（true/false）
+# 启用后可在管理后台查看访问记录
+ENABLE_ACCESS_LOG = "true"

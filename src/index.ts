@@ -4,6 +4,8 @@ interface Env {
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
   DAV_PREFIX?: string;
+  // 新增：启用访问日志
+  ENABLE_ACCESS_LOG?: string;
 }
 
 interface FileMeta {
@@ -14,24 +16,66 @@ interface FileMeta {
   updatedAt: string;
 }
 
-const METHODS = ["OPTIONS", "PROPFIND", "GET", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "HEAD"];
+// 新增：访问日志记录
+interface AccessLog {
+  timestamp: string;
+  method: string;
+  path: string;
+  status: number;
+  clientIp: string;
+  userAgent: string;
+  bytesSent?: number;
+  user: string;
+}
+
+const METHODS = ["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"];
 const META_PREFIX = "meta:";
 const DIR_PREFIX = "dir:";
 const CREDENTIALS_KEY = "config:credentials";
 const SESSION_PREFIX = "session:";
+const LOG_PREFIX = "log:";
+const TRASH_PREFIX = "trash:";
 const DEFAULT_USERNAME = "admin";
 const DEFAULT_PASSWORD = "admin123456";
 const SESSION_TTL = 60 * 60 * 24 * 7;
+const LOG_RETENTION_DAYS = 30;
+const TRASH_RETENTION_DAYS = 30;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const startTime = Date.now();
     const pathname = new URL(request.url).pathname;
+    const clientIp = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
+    const userAgent = request.headers.get("User-Agent") || "";
+    const contentLength = parseInt(request.headers.get("Content-Length") || "0");
+
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
     if (request.method === "OPTIONS") return optionsResponse();
-    if (!(await authenticate(request, env))) {
+
+    let authenticated = false;
+    let username = "anonymous";
+    if (await authenticate(request, env)) {
+      authenticated = true;
+      const credentials = await getCredentials(env);
+      username = credentials.username;
+    } else {
       return new Response("Unauthorized", {
         status: 401,
         headers: { "WWW-Authenticate": 'Basic realm="Cloudflare WebDAV"' },
+      });
+    }
+
+    // 新增：检查流量限制
+    const rateLimit = await checkRateLimit(env, clientIp, request.method, contentLength);
+    if (!rateLimit.allowed) {
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
+      return new Response("Too Many Requests", {
+        status: 429,
+        headers: {
+          "Retry-After": String(rateLimit.retryAfter),
+          "X-RateLimit-Limit": String(DEFAULT_RATE_LIMIT.maxRequestsPerMinute),
+          "X-RateLimit-Remaining": "0",
+        },
       });
     }
 
@@ -39,27 +83,53 @@ export default {
     try {
       path = requestPath(request, env);
     } catch {
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
       return textResponse("Bad Request", 400);
     }
 
+    let response: Response;
     try {
       switch (request.method) {
-        case "PROPFIND": return await propfind(request, env, path);
-        case "GET": return await getObject(env, path, false, request);
-        case "HEAD": return await getObject(env, path, true, request);
-        case "PUT": return await putObject(request, env, path);
-        case "DELETE": return await deletePath(env, path);
-        case "MKCOL": return await makeCollection(env, path);
-        case "COPY": return await copyOrMove(request, env, path, false);
-        case "MOVE": return await copyOrMove(request, env, path, true);
-        default: return textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
+        case "PROPFIND": response = await propfind(request, env, path); break;
+        case "GET": response = await getObject(env, path, false, request); break;
+        case "HEAD": response = await getObject(env, path, true, request); break;
+        case "PUT": response = await putObject(request, env, path); break;
+        case "DELETE": response = await deletePath(env, path); break;
+        case "MKCOL": response = await makeCollection(env, path); break;
+        case "COPY": response = await copyOrMove(request, env, path, false); break;
+        case "MOVE": response = await copyOrMove(request, env, path, true); break;
+        default:
+          response = textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
       }
     } catch (error) {
       console.error("WebDAV request failed", { method: request.method, path, error });
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
       return textResponse("Internal Server Error", 500);
     }
+
+    await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
+    return response;
   },
 };
+
+// 新增：记录访问日志
+async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }, startTime: number): Promise<void> {
+  if (env.ENABLE_ACCESS_LOG !== "true") return;
+
+  const accessLog: AccessLog = {
+    timestamp: log.timestamp || new Date().toISOString(),
+    method: log.method,
+    path: log.path,
+    status: log.status,
+    clientIp: log.clientIp,
+    userAgent: log.userAgent,
+    bytesSent: log.bytesSent,
+    user: log.user,
+  };
+
+  const logKey = `${LOG_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
+}
 
 async function authenticate(request: Request, env: Env): Promise<boolean> {
   const credentials = await getCredentials(env);
@@ -120,7 +190,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, username, { expirationTtl: SESSION_TTL });
     return new Response(null, { status: 303, headers: { Location: "/__admin", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
   }
-  if (!(await sessionUser(request, env))) return adminLoginPage();
+  const sessionUser_ = await sessionUser(request, env);
+  if (!sessionUser_) return adminLoginPage();
   if (url.pathname === "/__admin/account" && request.method === "POST") {
     const form = await request.formData();
     const username = String(form.get("username") ?? "").trim();
@@ -130,6 +201,11 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
     await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
     return adminPage("账号已更新，新的 WebDAV 凭证已生效");
+  }
+  // 新增：访问日志页面
+  if (url.pathname === "/__admin/logs") {
+    if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
+    return adminLogsPage(env);
   }
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
   return adminPage();
@@ -145,7 +221,7 @@ function adminLoginPage(error = ""): Response {
 }
 
 function adminPage(message = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 账号设置</title><style>${ADMIN_CSS}</style><main><h1>WebDAV 账号设置</h1>${message ? `<p class="success">${escapeXml(message)}</p>` : ""}<p>修改后，WebDAV 客户端需要使用新的用户名和密码重新连接。</p><form method="post" action="/__admin/account"><label>新用户名<input name="username" autocomplete="username" required></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><button>保存账号</button></form></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 账号设置</title><style>${ADMIN_CSS}</style><main><h1>WebDAV 账号设置</h1>${message ? `<p class="success">${escapeXml(message)}</p>` : ""}<p>修改后，WebDAV 客户端需要使用新的用户名和密码重新连接。</p><form method="post" action="/__admin/account"><label>新用户名<input name="username" autocomplete="username" required></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><button>保存账号</button></form><hr><p><a href="/__admin/logs">查看访问日志</a> | <a href="/__admin/trash">回收站</a></p></main>`);
 }
 
 const ADMIN_CSS = "body{font:16px system-ui,sans-serif;background:#f3f5f7;color:#18212b;margin:0}main{max-width:420px;margin:10vh auto;padding:32px;background:white;border:1px solid #d9e0e6;border-radius:8px;box-shadow:0 8px 30px #18212b14}h1{font-size:24px;margin-top:0}label{display:block;margin:18px 0 6px}input{box-sizing:border-box;width:100%;padding:11px;margin-top:6px;border:1px solid #aeb8c2;border-radius:5px;font-size:16px}button{margin-top:20px;padding:11px 18px;border:0;border-radius:5px;background:#1769aa;color:white;font-size:16px;cursor:pointer}.error{color:#b42318}.success{color:#067647}";
@@ -224,18 +300,116 @@ async function makeCollection(env: Env, path: string): Promise<Response> {
 
 async function deletePath(env: Env, path: string): Promise<Response> {
   if (!path) return textResponse("The root collection cannot be deleted", 403);
+
   const object = await env.WEBDAV_BUCKET.head(r2Key(path));
   if (object) {
+    // 软删除：移动到回收站
+    const trashKey = `${TRASH_PREFIX}${Date.now()}_${path}`;
+    const trashMeta = {
+      originalPath: path,
+      deletedAt: new Date().toISOString(),
+      size: object.size,
+      contentType: object.httpMetadata?.contentType,
+    };
+
+    // 复制文件到回收站位置（使用特殊前缀）
+    const fileContent = await env.WEBDAV_BUCKET.get(r2Key(path));
+    if (fileContent) {
+      await env.WEBDAV_BUCKET.put(`__trash/${trashKey}`, fileContent.body, {
+        httpMetadata: fileContent.httpMetadata,
+        customMetadata: { originalPath: path, deletedAt: trashMeta.deletedAt },
+      });
+    }
+
+    // 删除原文件
     await env.WEBDAV_BUCKET.delete(r2Key(path));
     await env.WEBDAV_KV.delete(metaKey(path));
+
+    // 记录删除信息到 KV（用于管理界面显示）
+    await env.WEBDAV_KV.put(`${TRASH_PREFIX}${path}`, JSON.stringify(trashMeta), {
+      expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60,
+    });
+
     return new Response(null, { status: 204 });
   }
+
+  // 目录删除
   if (!(await env.WEBDAV_KV.get(dirKey(path))) && !(await hasChildren(env, path))) return textResponse("Not Found", 404);
+
+  // 软删除目录及其内容
   const objects = await listAllObjects(env, `${path}/`);
+  const deletedAt = new Date().toISOString();
+
+  // 移动文件到回收站
   for (let index = 0; index < objects.length; index += 1000) {
-    await env.WEBDAV_BUCKET.delete(objects.slice(index, index + 1000).map((item) => item.key));
+    const batch = objects.slice(index, index + 1000);
+    for (const item of batch) {
+      const trashKey = `${TRASH_PREFIX}${Date.now()}_${item.key}`;
+      const fileContent = await env.WEBDAV_BUCKET.get(item.key);
+      if (fileContent) {
+        await env.WEBDAV_BUCKET.put(`__trash/${trashKey}`, fileContent.body, {
+          httpMetadata: fileContent.httpMetadata,
+          customMetadata: { originalPath: item.key, deletedAt },
+        });
+      }
+      await env.WEBDAV_BUCKET.delete(item.key);
+    }
   }
+
+  // 删除元数据
   await deleteMetadataUnder(env, path);
+
+  // 记录目录删除信息
+  await env.WEBDAV_KV.put(`${TRASH_PREFIX}${path}`, JSON.stringify({
+    originalPath: path,
+    deletedAt,
+    isDirectory: true,
+    fileCount: objects.length,
+  }), { expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60 });
+
+  return new Response(null, { status: 204 });
+}
+
+// 新增：恢复回收站文件
+async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> {
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashPath}`, "json") as { originalPath: string; deletedAt: string } | null;
+  if (!trashMeta) return textResponse("Not Found in Trash", 404);
+
+  // 恢复文件
+  const trashObjects = await listAllObjects(env, `__trash/${TRASH_PREFIX}`);
+  for (const obj of trashObjects) {
+    const customMeta = obj.customMetadata;
+    if (customMeta?.originalPath === trashMeta.originalPath || customMeta?.originalPath?.startsWith(`${trashMeta.originalPath}/`)) {
+      const content = await env.WEBDAV_BUCKET.get(obj.key);
+      if (content) {
+        await env.WEBDAV_BUCKET.put(customMeta.originalPath, content.body, {
+          httpMetadata: content.httpMetadata,
+        });
+      }
+      await env.WEBDAV_BUCKET.delete(obj.key);
+    }
+  }
+
+  // 删除回收站记录
+  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
+
+  return new Response(null, { status: 204 });
+}
+
+// 新增：清空回收站
+async function emptyTrash(env: Env): Promise<Response> {
+  const trashObjects = await listAllObjects(env, "__trash/");
+  for (let index = 0; index < trashObjects.length; index += 1000) {
+    const batch = trashObjects.slice(index, index + 1000);
+    await env.WEBDAV_BUCKET.delete(batch.map(item => item.key));
+  }
+
+  // 删除所有回收站元数据
+  const trashMetaKeys = await listAllKV(env, TRASH_PREFIX);
+  for (const key of trashMetaKeys) {
+    await env.WEBDAV_KV.delete(key);
+  }
+
   return new Response(null, { status: 204 });
 }
 
@@ -357,3 +531,148 @@ function escapeXml(value: string): string {
 function textResponse(body: string, status: number, extraHeaders: Record<string, string> = {}): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", ...extraHeaders } });
 }
+
+// 新增：流量限制配置
+interface RateLimitConfig {
+  maxRequestsPerMinute: number;
+  maxUploadBytesPerHour: number;
+}
+
+const DEFAULT_RATE_LIMIT: RateLimitConfig = {
+  maxRequestsPerMinute: 60,
+  maxUploadBytesPerHour: 1024 * 1024 * 1024, // 1GB
+};
+
+const RATE_LIMIT_PREFIX = "ratelimit:";
+
+// 新增：检查流量限制
+async function checkRateLimit(env: Env, clientIp: string, method: string, contentLength: number): Promise<{ allowed: boolean; retryAfter?: number }> {
+  // 默认限制，后续可扩展为从 KV 读取配置
+  const config = DEFAULT_RATE_LIMIT;
+  const now = Date.now();
+  const minuteKey = `${RATE_LIMIT_PREFIX}${clientIp}:minute:${Math.floor(now / 60000)}`;
+  const hourKey = `${RATE_LIMIT_PREFIX}${clientIp}:hour:${Math.floor(now / 3600000)}`;
+
+  // 检查每分钟请求数
+  const minuteCount = parseInt(await env.WEBDAV_KV.get(minuteKey) || "0");
+  if (minuteCount >= config.maxRequestsPerMinute) {
+    return { allowed: false, retryAfter: 60 - (Math.floor(now / 1000) % 60) };
+  }
+
+  // 检查每小时上传流量（仅对 PUT 请求）
+  if (method === "PUT") {
+    const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
+    if (hourBytes + contentLength > config.maxUploadBytesPerHour) {
+      return { allowed: false, retryAfter: 3600 - (Math.floor(now / 1000) % 3600) };
+    }
+  }
+
+  // 更新计数
+  await env.WEBDAV_KV.put(minuteKey, String(minuteCount + 1), { expirationTtl: 120 });
+  if (method === "PUT") {
+    const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
+    await env.WEBDAV_KV.put(hourKey, String(hourBytes + contentLength), { expirationTtl: 3700 });
+  }
+
+  return { allowed: true };
+}
+
+// 新增：访问日志页面
+async function adminLogsPage(env: Env): Promise<Response> {
+  const logs: AccessLog[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.WEBDAV_KV.list({ prefix: LOG_PREFIX, cursor, limit: 100 });
+    for (const key of page.keys) {
+      const log = await env.WEBDAV_KV.get(key.name, "json") as AccessLog | null;
+      if (log) logs.push(log);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const recentLogs = logs.slice(0, 100);
+
+  const logRows = recentLogs.map(log => {
+    const time = new Date(log.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+    const method = log.method;
+    const path = escapeXml(log.path || "/");
+    const status = log.status;
+    const statusClass = status >= 400 ? "error" : status >= 300 ? "warn" : "success";
+    const size = log.bytesSent ? formatBytes(log.bytesSent) : "-";
+    const ip = log.clientIp || "-";
+    const user = log.user || "-";
+    return `<tr><td>${time}</td><td><span class="method ${method}">${method}</span></td><td class="path">${path}</td><td><span class="status ${statusClass}">${status}</span></td><td>${size}</td><td>${ip}</td><td>${user}</td></tr>`;
+  }).join("");
+
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><main><h1>访问日志</h1><p>最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）</p><table><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || '<tr><td colspan="7">暂无日志</td></tr>'}</tbody></table><p><a href="/__admin">← 返回设置</a></p></main>`);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
+}
+
+const LOGS_CSS = `
+table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e1e4e8}
+th{background:#f6f8fa;font-weight:600}
+.path{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.method{padding:2px 6px;border-radius:3px;font-size:12px;font-weight:500}
+.method.GET{background:#e3f2fd;color:#1565c0}
+.method.PUT{background:#fff3e0;color:#e65100}
+.method.DELETE{background:#ffebee;color:#c62828}
+.method.MKCOL{background:#e8f5e9;color:#2e7d32}
+.method.COPY,.method.MOVE{background:#f3e5f5;color:#6a1b9a}
+.method.PROPFIND{background:#e0f2f1;color:#00695c}
+.status{padding:2px 6px;border-radius:3px;font-size:12px;font-weight:500}
+.status.success{background:#e8f5e9;color:#2e7d32}
+.status.warn{background:#fff3e0;color:#e65100}
+.status.error{background:#ffebee;color:#c62828}
+a{color:#1769aa;text-decoration:none}
+a:hover{text-decoration:underline}
+`;
+
+// 新增：回收站管理页面
+async function adminTrashPage(env: Env): Promise<Response> {
+  const trashItems: Array<{ path: string; originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean }> = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.WEBDAV_KV.list({ prefix: TRASH_PREFIX, cursor, limit: 100 });
+    for (const key of page.keys) {
+      const meta = await env.WEBDAV_KV.get(key.name, "json") as { originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean } | null;
+      if (meta) {
+        const path = decodeURIComponent(key.name.slice(TRASH_PREFIX.length));
+        trashItems.push({ path, ...meta });
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  trashItems.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+
+  const trashRows = trashItems.map(item => {
+    const time = new Date(item.deletedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+    const path = escapeXml(item.originalPath);
+    const type = item.isDirectory ? "目录" : "文件";
+    const size = item.size ? formatBytes(item.size) : "-";
+    return `<tr><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
+  }).join("");
+
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><main><h1>回收站</h1><p>已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p><table><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table>${trashItems.length > 0 ? '<form method="post" class="empty-form"><input type="hidden" name="action" value="empty"><button type="submit" class="empty-btn" onclick="return confirm(\'确定要清空回收站吗？此操作不可恢复！\')">清空回收站</button></form>' : ""}<p><a href="/__admin">← 返回设置</a></p></main>`);
+}
+
+const TRASH_CSS = `
+table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e1e4e8}
+th{background:#f6f8fa;font-weight:600}
+.restore-btn{padding:4px 12px;background:#2e7d32;color:white;border:0;border-radius:3px;cursor:pointer;font-size:12px}
+.restore-btn:hover{background:#1b5e20}
+.empty-form{margin:20px 0;text-align:center}
+.empty-btn{padding:10px 20px;background:#c62828;color:white;border:0;border-radius:5px;cursor:pointer;font-size:14px}
+.empty-btn:hover{background:#b71c1c}
+a{color:#1769aa;text-decoration:none}
+a:hover{text-decoration:underline}
+`;
