@@ -1,0 +1,20 @@
+{
+  "name": "cf-webdav",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A lightweight WebDAV server backed by Cloudflare R2 and KV.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "setup:resources": "node scripts/setup-resources.mjs",
+    "deploy:setup": "npm run setup:resources && npm run deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250415.0",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.36.0"
+  }
+}
