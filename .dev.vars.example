@@ -1,3 +1,9 @@
+# WebDAV 管理员凭证（本地开发使用）
+# 复制此文件为 .dev.vars 并修改密码
+# 注意：此文件不会被提交到 Git
+
 ADMIN_USERNAME=admin
-# 首次登录默认值也是 admin / admin123456；生产环境请部署后立即在 /__admin 修改
-ADMIN_PASSWORD=admin123456
+ADMIN_PASSWORD=change-this-local-password
+
+# 可选：路径前缀
+# DAV_PREFIX=team-files

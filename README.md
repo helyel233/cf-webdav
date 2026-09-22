@@ -6,6 +6,34 @@
 
 支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY` 和 `MOVE`。首次默认账号为 `admin`，默认密码为 `admin123456`；登录部署地址的 `/__admin` 管理页面后可以修改账号密码。修改后的凭证安全哈希存储在 KV 中。
 
+## 部署前必读
+
+### 资源命名注意事项
+
+Cloudflare 的 KV namespace 和 R2 bucket 名称需要**全局唯一**。默认名称 `cf-webdav-kv` 和 `cf-webdav-files` 可能已被其他用户使用。
+
+**建议**：在默认名称后添加随机后缀，例如：
+- `cf-webdav-kv-a1b2c3`
+- `cf-webdav-files-xyz789`
+
+如果遇到"名称已被使用"的错误，请更换其他名称。
+
+### 权限要求
+
+部署需要以下 Cloudflare 权限：
+- **Workers 读写权限**：创建和部署 Worker
+- **KV 读写权限**：创建和修改 KV namespace
+- **R2 读写权限**：创建和修改 R2 bucket
+
+**检查权限**：
+1. 登录 Cloudflare Dashboard
+2. 进入 **My Profile -> API Tokens**
+3. 检查你的 token 是否包含上述权限
+
+**如果控制台没有 "Create new" 按钮**：
+- 可能是权限不足，请联系账号管理员添加权限
+- 或先在 **R2 Object Storage** 和 **Workers & Pages -> KV** 手动创建资源，再在 Worker 绑定中选择已有资源
+
 ## 部署方式（按推荐顺序）
 
 ### 方式一：Cloudflare 控制台创建并绑定资源（首选）
@@ -15,20 +43,20 @@
 1. 登录 Cloudflare Dashboard，选择目标账号。
 2. 打开 **Workers & Pages -> Create application**，连接 GitHub 并选择本仓库；如果已经创建了 `cf-webdav` Worker，直接打开它。
 3. 在 Worker 的 **Settings -> Variables and Bindings** 中点击 **Add binding**。
-4. 选择 **R2 Bucket**，Binding name 填写 `WEBDAV_BUCKET`，点击 **Create new bucket**，名称填写 `cf-webdav-files`，创建后选择它。
-5. 再次点击 **Add binding**，选择 **KV Namespace**，Binding name 填写 `WEBDAV_KV`，点击 **Create new namespace**，名称填写 `cf-webdav-kv`，创建后选择它。
+4. 选择 **R2 Bucket**，Binding name 填写 `WEBDAV_BUCKET`，点击 **Create new bucket**，名称填写 `cf-webdav-files`（或自定义名称），创建后选择它。
+5. 再次点击 **Add binding**，选择 **KV Namespace**，Binding name 填写 `WEBDAV_KV`，点击 **Create new namespace**，名称填写 `cf-webdav-kv`（或自定义名称），创建后选择它。
 6. 添加普通变量 `DAV_PREFIX`，默认值留空；需要路径前缀时填写例如 `team-files`。
 7. 在 **Secrets** 中按需添加 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`，用于覆盖首次默认账号。
 8. 点击 **Save** 并部署 Worker。
 
-如果控制台没有 **Create new** 按钮，通常是账号或 Token 缺少 R2/KV 编辑权限。可先在 **R2 Object Storage** 创建 `cf-webdav-files`，再在 **Workers & Pages -> KV** 创建 `cf-webdav-kv`，回到绑定页面选择已有资源。
+如果控制台没有 **Create new** 按钮，请参考上方的"权限要求"章节。
 
 ### 方式二：Cloudflare 控制台连接 GitHub，并在绑定时创建资源
 
 适合希望后续由 GitHub 自动部署的用户。
 
 1. 在 **Workers & Pages -> Create application** 中连接 GitHub，授权并选择本仓库。
-2. 绑定配置仍使用 `WEBDAV_BUCKET`、`WEBDAV_KV`，资源名称使用默认值 `cf-webdav-files`、`cf-webdav-kv`。
+2. 绑定配置仍使用 `WEBDAV_BUCKET`、`WEBDAV_KV`，资源名称使用默认值 `cf-webdav-files`、`cf-webdav-kv`（如已被使用，请更换名称）。
 3. 如果绑定选择框提供 **Create new bucket** 和 **Create new namespace**，直接创建并绑定；否则先按方式一手动创建资源。
 4. 在 GitHub 仓库 **Settings -> Secrets and variables -> Actions** 添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
 5. 推送到 `main` 或手动运行 `Deploy Worker`。工作流会自动检查并复用默认 KV/R2，然后部署 Worker。
@@ -56,7 +84,45 @@ npm run deploy
 
 不建议首次用户直接使用此方式，因为 KV namespace ID 是账号专属值，不能使用通用固定值。
 
-### 登录和验证
+## 部署验证
+
+部署完成后，按以下步骤验证：
+
+### 1. 检查 Worker 状态
+
+在 Cloudflare Dashboard 的 **Workers & Pages** 中，确认 Worker 状态为 **Active**，且显示正确的 URL（如 `https://cf-webdav.your-subdomain.workers.dev`）。
+
+### 2. 检查资源绑定
+
+在 Worker 的 **Settings -> Variables and Bindings** 中，确认：
+- `WEBDAV_BUCKET` 已绑定到 R2 bucket
+- `WEBDAV_KV` 已绑定到 KV namespace
+
+### 3. 访问管理页面
+
+打开浏览器访问 `https://你的-worker.workers.dev/__admin`，应该能看到登录页面。
+
+### 4. 测试 WebDAV 功能
+
+```sh
+# 测试连接（使用默认凭证）
+curl -u admin:admin123456 -X OPTIONS https://你的-worker.workers.dev/
+
+# 测试创建目录
+curl -u admin:admin123456 -X MKCOL https://你的-worker.workers.dev/test-folder
+
+# 测试列出目录
+curl -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.workers.dev/
+```
+
+### 5. 查看日志
+
+如果遇到问题，可在 Cloudflare Dashboard 的 Worker 页面查看实时日志：
+1. 进入 Worker 页面
+2. 点击 **Logs** 标签
+3. 点击 **Start log stream** 开始查看实时日志
+
+## 登录和验证
 
 打开 Worker 的 `workers.dev` 地址，访问 `/__admin`：
 
@@ -64,25 +130,27 @@ npm run deploy
 https://你的-worker.workers.dev/__admin
 ```
 
-没有配置 Secret 时，首次登录使用 `admin / admin123456`，进入页面后立即修改账号密码。随后使用 WebDAV 客户端或下面的请求验证：
+没有配置 Secret 时，首次登录使用 `admin / admin123456`，进入页面后**立即修改账号密码**。随后使用 WebDAV 客户端或下面的请求验证：
 
 ```sh
 curl -u 新用户名:新密码 -X PROPFIND -H 'Depth: 1' https://你的-worker.workers.dev/
 ```
 
-控制台部署不会执行仓库中的 `scripts/setup-resources.mjs`。控制台流程会直接创建并绑定 R2/KV；`scripts/setup-resources.mjs` 仅用于本地 `npm run deploy:setup` 和 GitHub Actions 自动创建资源。
+> **注意**：控制台部署不会执行仓库中的 `scripts/setup-resources.mjs`。控制台流程会直接创建并绑定 R2/KV；`scripts/setup-resources.mjs` 仅用于本地 `npm run deploy:setup` 和 GitHub Actions 自动创建资源。
 
 ## 配置
 
 | 配置 | 类型 | 说明 |
 | --- | --- | --- |
 | `WEBDAV_BUCKET` | R2 binding | 文件内容的唯一存储位置 |
-| `WEBDAV_KV` | KV binding | 目录标记、文件元数据和后续扩展配置 |
-| `ADMIN_USERNAME` | Secret | Basic Auth 用户名 |
-| `ADMIN_PASSWORD` | Secret | Basic Auth 密码 |
+| `WEBDAV_KV` | KV binding | 目录标记、文件元数据和凭证配置 |
+| `ADMIN_USERNAME` | Secret | Basic Auth 用户名（可选，默认 `admin`） |
+| `ADMIN_PASSWORD` | Secret | Basic Auth 密码（可选，默认 `admin123456`） |
 | `DAV_PREFIX` | var | 可选的 R2 key 前缀，例如 `team-files` |
 
 如果未设置 `ADMIN_USERNAME` 或 `ADMIN_PASSWORD`，代码使用默认值仅作为首次引导；账号修改后，KV 中的配置优先于环境变量。
+
+> **安全提示**：首次部署后请立即修改默认密码。生产环境请始终使用 HTTPS；Basic Auth 只应在 HTTPS 上使用。
 
 KV 与 R2 的关系是：R2 保存可恢复的文件字节，KV 只保存可重建或用于加速目录展示的元数据。任何写入都会先写 R2，再写 KV；读取文件始终以 R2 为准，因此 KV 延迟或丢失不会损坏文件内容。
 
@@ -107,7 +175,7 @@ curl -i -u admin:change-this-local-password -X PROPFIND -H 'Depth: 1' http://loc
 curl -i -u admin:change-this-local-password http://localhost:8787/docs/hello.txt
 ```
 
-挂载到客户端时使用部署 URL，例如 macOS Finder 的“前往服务器”或 Linux 的 `davfs2`。生产环境请始终使用 HTTPS；Basic Auth 只应在 HTTPS 上使用。
+挂载到客户端时使用部署 URL，例如 macOS Finder 的"前往服务器"或 Linux 的 `davfs2`。生产环境请始终使用 HTTPS；Basic Auth 只应在 HTTPS 上使用。
 
 ## 限制与扩展
 
