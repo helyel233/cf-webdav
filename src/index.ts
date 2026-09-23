@@ -338,7 +338,9 @@ async function adminFilesPage(request: Request, env: Env): Promise<Response> {
   }
   const prefix = currentPath ? `${currentPath}/` : "";
   const listed = await env.WEBDAV_BUCKET.list({ prefix, delimiter: "/" });
-  const directories = listed.delimitedPrefixes.map((item) => item.slice(0, -1));
+  const directories = listed.delimitedPrefixes
+    .filter((item) => !item.startsWith("__trash/"))
+    .map((item) => item.slice(0, -1));
   const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
   const rows = [
