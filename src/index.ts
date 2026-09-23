@@ -253,7 +253,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await env.WEBDAV_KV.put(ADMIN_CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
       return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
-    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) return adminFilesAction(request, env, form);
+    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) return adminFilesAction(request, env, form, sessionUser_);
     if (view === "trash" && ["restore", "empty"].includes(action)) {
       if (action === "empty") await emptyTrash(env);
       else await restoreFromTrash(env, String(form.get("path") || ""));
@@ -289,29 +289,42 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
 
 function adminPath(value: string): string {
   const path = value.trim().replace(/^\/+|\/+$/g, "");
+  if (!path) return "";
   if (path.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid path");
   return path;
 }
 
-async function adminFilesAction(request: Request, env: Env, form: FormData): Promise<Response> {
+async function adminFilesAction(request: Request, env: Env, form: FormData, username: string): Promise<Response> {
   const action = String(form.get("action") || "");
   const currentPath = adminPath(String(form.get("currentPath") || ""));
+  let operationPath = currentPath;
+  let operationMethod = "POST";
+  let responseStatus = 303;
   try {
     if (action === "upload") {
       const file = form.get("file");
       if (!(file instanceof File) || !file.name) return textResponse("请选择文件", 400);
       const path = adminPath(`${currentPath ? `${currentPath}/` : ""}${file.name}`);
+      operationPath = path;
+      operationMethod = "PUT";
       await env.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
       await env.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
     } else if (action === "mkdir") {
       const name = String(form.get("name") || "");
-      await makeCollection(env, adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`));
+      operationPath = adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`);
+      operationMethod = "MKCOL";
+      const response = await makeCollection(env, operationPath);
+      responseStatus = response.status;
     } else if (action === "delete") {
-      await deletePath(env, adminPath(String(form.get("path") || "")));
+      operationPath = adminPath(String(form.get("path") || ""));
+      operationMethod = "DELETE";
+      const response = await deletePath(env, operationPath);
+      responseStatus = response.status;
     }
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
   }
+  await logAccess(env, { method: operationMethod, path: operationPath, status: responseStatus, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username }, Date.now());
   return new Response(null, { status: 303, headers: { Location: `/?view=files${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}` } });
 }
 
