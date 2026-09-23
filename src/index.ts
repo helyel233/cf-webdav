@@ -223,7 +223,11 @@ function createScopedEnv(env: Env, scope: string): Env {
       if (property === "get" || property === "put" || property === "delete") {
         return (...args: unknown[]) => {
           if (property === "get" || property === "delete") return (target[property as "get" | "delete"] as Function).call(target, `${scope}/kv/${args[0]}`, ...args.slice(1));
-          return target.put(`${scope}/kv/${args[0]}`, args[1], args[2]);
+          return target.put(
+            `${scope}/kv/${args[0]}`,
+            args[1] as Parameters<KVNamespace["put"]>[1],
+            args[2] as Parameters<KVNamespace["put"]>[2],
+          );
         };
       }
       if (property === "list") return async (options: { prefix?: string; [key: string]: unknown } = {}) => {
