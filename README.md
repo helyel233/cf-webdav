@@ -26,21 +26,26 @@
 
 这是最容易上手的方案，适合没有本地 Node 环境、或不想先碰 Wrangler 的用户。
 
+最简的控制台部署步骤清单：
+
 1. 登录 Cloudflare Dashboard
 2. 进入 **Workers & Pages -> Create application**
-3. 选择创建一个 Worker
-4. 在 **Settings -> Variables and Bindings** 中点击 **Add binding**
-5. 添加以下绑定：
-   - `WEBDAV_BUCKET`：选择或新建 R2 Bucket
-   - `WEBDAV_KV`：选择或新建 KV Namespace
+3. 创建一个 Worker，并给它起一个名字，例如 `cf-webdav`
+4. 打开 **Settings -> Variables and Bindings**
+5. 点击 **Add binding**，依次添加：
+   - `WEBDAV_BUCKET`：新建或选择一个 R2 Bucket
+   - `WEBDAV_KV`：新建或选择一个 KV Namespace
    - `DAV_PREFIX`：可选，默认留空
-   - `ENABLE_ACCESS_LOG`：可选，默认设为 `true`
-6. 如需设置管理员账号，可在 **Secrets** 中添加：
+   - `ENABLE_ACCESS_LOG`：可选，建议设为 `true`
+6. 如果需要自定义管理账号，打开 **Settings -> Secrets**，添加：
    - `ADMIN_USERNAME`
    - `ADMIN_PASSWORD`
-7. 保存并点击部署
+7. 保存绑定配置后，点击 **Deploy**，等待发布完成
+8. 打开 `https://你的-worker.workers.dev/__admin`，首次登录使用 `admin / admin123456`
 
-如果你在 Cloudflare 控制台里创建 Worker，默认可以直接填写以下命令：
+> 重要：如果你已经在 Cloudflare Dashboard 中手动绑定了 KV/R2，那么不要再本地执行 `npm run deploy`，除非你已经把 [wrangler.toml](wrangler.toml) 里的 `id` 改成真实的 KV Namespace ID。否则 `replace-during-setup` 这种占位值会被当成真实 ID 发送给 Cloudflare API，导致部署失败。
+
+如果你使用 **GitHub 连接部署**，可以在构建设置中填写以下默认命令：
 
 ```bash
 # 构建命令（Build command）
@@ -51,7 +56,11 @@ npm run typecheck
 npm run deploy
 ```
 
-> 说明：在 Cloudflare 的 GitHub 连接部署页面中，`Build command` 可以直接填 `npm run typecheck`，`Deploy command` 固定填 `npm run deploy`。这样最简单，也最容易排查问题。
+> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。这组命令只适合 GitHub 连接部署流程；如果你已经在 Cloudflare Dashboard 中手动绑定了 KV/R2，也不要带着 [wrangler.toml](wrangler.toml) 里的占位 `replace-during-setup` 去本地执行 `npm run deploy`，否则会把无效的占位 KV ID 传给 Cloudflare API，导致部署失败。
+
+> 正确做法：
+> - 方式 A：使用控制台按钮部署，或者让 GitHub 自动部署
+> - 方式 B：在本地先执行 `npm run deploy:setup`，自动写入真实的 KV Namespace ID，再执行 `npm run deploy`
 
 ### 方式 B：本地自动创建资源并部署
 

@@ -3,8 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-09-22"
 workers_dev = true
 
-# 如果你在 Cloudflare Dashboard 中手动绑定了 KV/R2，这里的占位值会被控制台绑定覆盖。
-# 只有本地或 CI 中使用 Wrangler 部署时，才需要保证这里的 id 与真实 KV Namespace 一致。
+# 如果你在 Cloudflare Dashboard 中手动绑定了 KV/R2，部署时不要在本地直接执行 `wrangler deploy`。
+# 该占位值仅用于说明：本地/CI 部署前需要先替换成真实的 KV Namespace ID。
+# 只有在执行 `npm run deploy:setup` 或手动填入真实 ID 后，才可以正常部署。
 
 [[kv_namespaces]]
 binding = "WEBDAV_KV"
