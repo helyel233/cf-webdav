@@ -5,7 +5,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "lib": ["ES2022", "WebWorker"],
+    "lib": ["ES2022"],
+    "types": ["./worker-configuration.d.ts"],
     "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "worker-configuration.d.ts"]

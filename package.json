@@ -9,11 +9,10 @@
     "deploy": "wrangler deploy",
     "setup:resources": "node scripts/setup-resources.mjs",
     "deploy:setup": "npm run setup:resources && npm run deploy",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "wrangler types && tsc --noEmit",
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260921.1",
     "typescript": "^5.9.2",
     "wrangler": "^4.36.0"
   }
