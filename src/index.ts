@@ -53,7 +53,7 @@ export default {
     const userAgent = request.headers.get("User-Agent") || "";
     const contentLength = parseInt(request.headers.get("Content-Length") || "0");
 
-    if (pathname === "/" && request.method === "GET") return adminRequest(request, env);
+    if (pathname === "/" && (request.method === "GET" || request.method === "POST")) return adminRequest(request, env);
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
     if (request.method === "OPTIONS") return optionsResponse();
 
