@@ -53,10 +53,12 @@ Cloudflare 的 KV namespace 和 R2 bucket 名称需要**全局唯一**。默认�
 
    | 命令类型 | 填写内容 | 说明 |
    | --- | --- | --- |
-   | **构建命令** (Build command) | `npm install` | 安装项目依赖 |
+   | **构建命令** (Build command) | 留空 或 `npm run typecheck` | Cloudflare 会自动安装依赖；留空即可，或填写类型检查命令 |
    | **部署命令** (Deploy command) | `npm run deploy` | 执行 `wrangler deploy` 部署 Worker |
    | **预览命令** (Preview command) | `npm run dev` | 执行 `wrangler dev` 启动本地预览（可选） |
 
+   > **说明**：Cloudflare 会自动检测并使用 bun/npm 安装依赖，因此构建命令通常不需要填写 `npm install`。如需在构建时进行类型检查，可填写 `npm run typecheck`。
+   > 
    > **注意**：预览命令用于 Preview Deployments（预览部署），如需启用 PR 预览功能才需要填写。如果不需要预览环境，可以留空。
 
 5. 在 GitHub 仓库 **Settings -> Secrets and variables -> Actions** 添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
