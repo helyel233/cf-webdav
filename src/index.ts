@@ -427,9 +427,12 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       return adminFilesAction(request, createScopedEnv(env, storageScope(selected)), form, sessionUser_, selected.username);
     }
     if (view === "trash" && ["restore", "empty"].includes(action)) {
-      if (action === "empty") await emptyTrash(env);
-      else await restoreFromTrash(env, String(form.get("path") || ""));
-      return new Response(null, { status: 303, headers: { Location: "/?view=trash" } });
+      const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
+      if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
+      const scopedEnv = createScopedEnv(env, storageScope(selected));
+      if (action === "empty") await emptyTrash(scopedEnv);
+      else await restoreFromTrash(scopedEnv, String(form.get("path") || ""));
+      return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
   }
   if (url.pathname === "/__admin/account" && request.method === "POST") {
@@ -454,7 +457,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (view === "account") return selectedAccount ? adminAccountPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "logs") return adminLogsPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
   if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
-  if (view === "trash") return adminTrashPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
+  if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "accounts") return adminAccountsPage(request, env, sessionUser_);
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
   return adminPage(request, env);
@@ -576,7 +579,9 @@ function htmlResponse(body: string): Response {
     : "";
   const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
   const withLogout = renderedBody.replace('<span class="status-dot">服务在线</span>', '<span class="status-dot">服务在线</span><a class="text-link" style="color:#dcebe6;margin-left:16px" href="/?action=logout">退出当前账户</a>');
-  return new Response(withLogout, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+  const accountFileLink = withLogout.match(/<a class="secondary-button inline-button" href="\/\?view=files&account=([^"]+)">打开此账户文件<\/a>/);
+  const withAccountTools = accountFileLink ? withLogout.replace(accountFileLink[0], `${accountFileLink[0]}<a class="secondary-button inline-button" href="/?view=logs&account=${accountFileLink[1]}">访问日志</a><a class="secondary-button inline-button" href="/?view=trash&account=${accountFileLink[1]}">回收站</a>`) : withLogout;
+  return new Response(withAccountTools, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 function requestPath(request: Request, env: Env, account?: WebdavAccount): string {
@@ -991,7 +996,7 @@ a:hover{text-decoration:underline}
 `;
 
 // 新增：回收站管理页面
-async function adminTrashPage(env: Env): Promise<Response> {
+async function adminTrashPage(env: Env, accountUsername: string): Promise<Response> {
   const trashItems: Array<{ path: string; originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean }> = [];
   let cursor: string | undefined;
   do {
@@ -1013,10 +1018,10 @@ async function adminTrashPage(env: Env): Promise<Response> {
     const path = escapeXml(item.originalPath);
     const type = item.isDirectory ? "目录" : "文件";
     const size = item.size ? formatBytes(item.size) : "-";
-    return `<tr><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
+    return `<tr><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><main class="dashboard"><h1>回收站</h1><p>已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p><table><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table>${trashItems.length > 0 ? '<form method="post" action="/?view=trash" class="empty-form"><input type="hidden" name="action" value="empty"><button type="submit" class="empty-btn" onclick="return confirm(\'确定要清空回收站吗？此操作不可恢复！\')">清空回收站</button></form>' : ""}<p><a href="/">← 返回管理中心</a></p></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><main class="dashboard"><h1>回收站</h1><p>账户：${escapeHtml(accountUsername)}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p><table><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table>${trashItems.length > 0 ? `<form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="empty-form"><input type="hidden" name="action" value="empty"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form>` : ""}<p><a href="/?view=account&account=${encodeURIComponent(accountUsername)}">← 返回账户管理</a></p></main>`);
 }
 
 const TRASH_CSS = `
