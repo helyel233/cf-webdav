@@ -91,15 +91,22 @@
 
 ##### 选项 2：连接 GitHub 自动发布
 
-如果希望每次推送代码后自动部署：
+如果希望通过 Dashboard 连接 GitHub，并在之后通过推送自动部署，按下面步骤操作：
 
-1. 在 Worker 的代码或部署页面选择 **Connect to Git**，连接包含本项目的 GitHub 仓库。
-2. 在仓库的 [wrangler.toml](wrangler.toml) 中，将 `id = "replace-during-setup"` 替换为第 1 步保存的真实 KV Namespace ID。
-3. 确认 `bucket_name` 与第 1 步创建的 R2 Bucket 名称一致。
-4. 提交并推送 [wrangler.toml](wrangler.toml)，重新触发部署。
-5. 构建命令可填写 `npm run typecheck`，部署命令填写 `npm run deploy`。
+1. 在 Worker 的 **Deployments** 或代码页面点击 **Connect to Git**。
+2. 授权 Cloudflare 访问 GitHub，选择包含本项目的账号、仓库和部署分支（通常是 `main`）。
+3. 在仓库的 [wrangler.toml](wrangler.toml) 中，将 `id = "replace-during-setup"` 替换为第 1 步保存的真实 KV Namespace ID。
+4. 确认 `bucket_name` 与第 1 步创建的 R2 Bucket 名称一致，并提交推送 [wrangler.toml](wrangler.toml)。
+5. 回到 Cloudflare 的 Git 部署设置，确认项目根目录为仓库根目录，并填写：
+  - **Build command**：`npm run typecheck`
+  - **Deploy command**：`npm run deploy`
+  - **Root directory**：留空（本项目的 `package.json` 在仓库根目录）
+6. 点击 **Save and Deploy**、**Deploy** 或页面上的同名确认按钮，开始第一次构建和发布。Cloudflare 会从选定分支拉取代码，安装依赖，执行构建命令，再执行部署命令。
+7. 打开 **Deployments** 查看构建日志。显示部署成功后，复制 Worker 的 `workers.dev` 地址，访问 `/__admin` 验证。
 
-GitHub 部署时，Dashboard 中创建的绑定不会自动改写仓库配置；如果不想把账号专属的 KV ID 提交到 Git 仓库，请使用上面的 Dashboard 直接发布方式。
+连接完成后的日常发布方式是：修改代码并推送到刚才选择的部署分支，Cloudflare 会自动创建新的部署。也可以在 **Deployments** 中打开某次历史部署，使用页面提供的 **Retry deployment** 或 **Redeploy** 重新发布；具体按钮名称会因 Dashboard 版本而略有不同。
+
+GitHub 部署时，Dashboard 中创建的 KV/R2 绑定不会自动改写仓库配置；当前项目的 `npm run deploy` 会先检查 KV ID，所以必须先完成第 3 步。如果不想把账号专属的 KV ID 提交到 Git 仓库，请使用上面的 Dashboard 直接发布方式。
 
 #### 第 5 步：验证部署
 
