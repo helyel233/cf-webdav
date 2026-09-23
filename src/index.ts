@@ -988,15 +988,16 @@ async function propfind(request: Request, env: Env, path: string, account?: Webd
 async function propResponse(request: Request, env: Env, path: string, directory: boolean, account?: WebdavAccount): Promise<string> {
   const object = directory ? null : await env.WEBDAV_BUCKET.head(r2Key(path));
   const displayName = path ? path.slice(path.lastIndexOf("/") + 1) : "WebDAV";
-  const href = `${new URL(request.url).origin}${urlPath(env, path)}${directory ? "/" : ""}`;
+  const href = `${new URL(request.url).origin}${urlPath(env, path, account)}${directory ? "/" : ""}`;
   const size = object?.size ?? 0;
   const modified = object?.uploaded?.toUTCString() ?? new Date().toUTCString();
   return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
 }
 
-function urlPath(env: Env, path: string): string {
+function urlPath(env: Env, path: string, account?: WebdavAccount): string {
   const prefix = normalizePrefix(env.DAV_PREFIX ?? "");
-  return `/${[prefix, path].filter(Boolean).join("/").split("/").map(encodeURIComponent).join("/")}`;
+  const accountPrefix = account ? `${account.owner}/${account.uuid}` : "";
+  return `/${[prefix, accountPrefix, path].filter(Boolean).join("/").split("/").map(encodeURIComponent).join("/")}`;
 }
 
 async function listChildren(env: Env, path: string): Promise<Array<{ path: string; directory: boolean }>> {
