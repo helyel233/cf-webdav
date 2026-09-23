@@ -42,12 +42,32 @@ Cloudflare 的 KV namespace 和 R2 bucket 名称需要**全局唯一**。默认�
 
 ## 部署方式（按推荐顺序）
 
-### 方式一：Cloudflare 控制台创建并绑定资源（首选）
+### 方式一：Cloudflare 控制台连接 GitHub（推荐）
 
-此方式最适合首次部署，不需要本地安装 Node.js，也不需要手动填写 KV namespace ID。
+适合希望后续由 GitHub 自动部署的用户，支持自动构建和持续部署。
+
+1. 在 **Workers & Pages -> Create application** 中连接 GitHub，授权并选择本仓库。
+2. 绑定配置使用 `WEBDAV_BUCKET`、`WEBDAV_KV`，资源名称使用默认值 `cf-webdav-files`、`cf-webdav-kv`（如已被使用，请更换名称）。
+3. 如果绑定选择框提供 **Create new bucket** 和 **Create new namespace**，直接创建并绑定；否则先手动创建资源（参考方式二）。
+4. **配置构建和部署命令**（在连接 GitHub 后的配置页面中填写）：
+
+   | 命令类型 | 填写内容 | 说明 |
+   | --- | --- | --- |
+   | **构建命令** (Build command) | `npm install` | 安装项目依赖 |
+   | **部署命令** (Deploy command) | `npm run deploy` | 执行 `wrangler deploy` 部署 Worker |
+   | **预览命令** (Preview command) | `npm run dev` | 执行 `wrangler dev` 启动本地预览（可选） |
+
+   > **注意**：预览命令用于 Preview Deployments（预览部署），如需启用 PR 预览功能才需要填写。如果不需要预览环境，可以留空。
+
+5. 在 GitHub 仓库 **Settings -> Secrets and variables -> Actions** 添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
+6. 推送到 `main` 或手动运行 `Deploy Worker`。工作流会自动检查并复用默认 KV/R2，然后部署 Worker。
+
+### 方式二：Cloudflare 控制台手动创建并绑定资源
+
+适合首次部署、不需要 GitHub 自动部署的用户。不需要本地安装 Node.js，也不需要手动填写 KV namespace ID。
 
 1. 登录 Cloudflare Dashboard，选择目标账号。
-2. 打开 **Workers & Pages -> Create application**，连接 GitHub 并选择本仓库；如果已经创建了 `cf-webdav` Worker，直接打开它。
+2. 打开 **Workers & Pages -> Create application**，选择创建 Worker。
 3. 在 Worker 的 **Settings -> Variables and Bindings** 中点击 **Add binding**。
 4. 选择 **R2 Bucket**，Binding name 填写 `WEBDAV_BUCKET`，点击 **Create new bucket**，名称填写 `cf-webdav-files`（或自定义名称），创建后选择它。
 5. 再次点击 **Add binding**，选择 **KV Namespace**，Binding name 填写 `WEBDAV_KV`，点击 **Create new namespace**，名称填写 `cf-webdav-kv`（或自定义名称），创建后选择它。
@@ -56,16 +76,6 @@ Cloudflare 的 KV namespace 和 R2 bucket 名称需要**全局唯一**。默认�
 8. 点击 **Save** 并部署 Worker。
 
 如果控制台没有 **Create new** 按钮，请参考上方的"权限要求"章节。
-
-### 方式二：Cloudflare 控制台连接 GitHub，并在绑定时创建资源
-
-适合希望后续由 GitHub 自动部署的用户。
-
-1. 在 **Workers & Pages -> Create application** 中连接 GitHub，授权并选择本仓库。
-2. 绑定配置仍使用 `WEBDAV_BUCKET`、`WEBDAV_KV`，资源名称使用默认值 `cf-webdav-files`、`cf-webdav-kv`（如已被使用，请更换名称）。
-3. 如果绑定选择框提供 **Create new bucket** 和 **Create new namespace**，直接创建并绑定；否则先按方式一手动创建资源。
-4. 在 GitHub 仓库 **Settings -> Secrets and variables -> Actions** 添加 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
-5. 推送到 `main` 或手动运行 `Deploy Worker`。工作流会自动检查并复用默认 KV/R2，然后部署 Worker。
 
 ### 方式三：本地脚本自动创建 KV/R2
 
