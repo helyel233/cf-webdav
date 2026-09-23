@@ -10,12 +10,12 @@ workers_dev = true
 [[kv_namespaces]]
 binding = "WEBDAV_KV"
 # 本地部署时，执行 `npm run deploy:setup` 会自动回写真实的 KV Namespace ID。
-id = "replace-during-setup"
+id = "2e222f80651b43c69c9acb7e1b238efb"
 
 [[r2_buckets]]
 binding = "WEBDAV_BUCKET"
 # 该名称需全局唯一；如果已被占用，请替换为带随机后缀的名称，例如 cf-webdav-files-xyz789
-bucket_name = "cf-webdav-files"
+bucket_name = "cf-webdav-files-helyel2332"
 
 [vars]
 # 留空表示根路径；如需添加固定前缀，可设置为 "team-files"
