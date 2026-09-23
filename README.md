@@ -43,7 +43,7 @@
 7. 保存绑定配置后，点击 **Deploy**，等待发布完成
 8. 打开 `https://你的-worker.workers.dev/__admin`，首次登录使用 `admin / admin123456`
 
-> 重要：如果你使用 GitHub 连接部署，Cloudflare 仍会执行 `wrangler deploy` 并读取 [wrangler.toml](wrangler.toml)。即使你已经在 Dashboard 中手动绑定了 KV/R2，也必须先把其中的 `id` 改成真实的 KV Namespace ID；`replace-during-setup` 不能用于部署。
+> 重要：如果你使用 GitHub 连接部署，Cloudflare 仍会执行 `wrangler deploy` 并读取 [wrangler.toml](wrangler.toml)。Dashboard 中创建的绑定不会自动替换仓库文件里的配置，因此必须先把其中的 `id` 改成真实的 KV Namespace ID；`replace-during-setup` 不能用于部署。
 
 如果你使用 **GitHub 连接部署**，可以在构建设置中填写以下默认命令：
 
@@ -56,7 +56,17 @@ npm run typecheck
 npm run deploy
 ```
 
-> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。这组命令只适合 GitHub 连接部署流程，并且要求 [wrangler.toml](wrangler.toml) 中已经写入真实的 KV Namespace ID。
+> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。只有使用 GitHub 连接部署时，才填写这两条命令，并且需要先完成下面的配置。
+
+如果使用 GitHub 连接部署，请先完成以下配置：
+
+1. 打开 Cloudflare Dashboard -> **Storage & databases -> KV**
+2. 打开实际绑定给 `WEBDAV_KV` 的 Namespace，复制 **Namespace ID**
+3. 将 [wrangler.toml](wrangler.toml) 中的 `id = "replace-during-setup"` 替换为复制的真实 ID
+4. 确认 `bucket_name` 与实际绑定给 `WEBDAV_BUCKET` 的 R2 Bucket 名称一致
+5. 提交并推送 [wrangler.toml](wrangler.toml)，重新触发 GitHub 部署
+
+如果不想把账号专属的 KV ID 写入 Git 仓库，请不要使用 GitHub 的 `npm run deploy`，改用 Dashboard 的 **Deploy** 按钮，或在本地执行 `npm run deploy:setup`。
 
 > 正确做法：
 > - 方式 A：使用控制台按钮部署，或者让 GitHub 自动部署
