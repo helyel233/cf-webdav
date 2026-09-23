@@ -22,55 +22,91 @@
 
 ## 一键部署流程
 
-### 方式 A：控制台手动创建并绑定（最适合小白，推荐优先）
+### 方式 A：控制台部署（适合不想使用本地 Node 的用户）
 
-这是最容易上手的方案，适合没有本地 Node 环境、或不想先碰 Wrangler 的用户。
+控制台部署分为两种情况：
 
-最简的控制台部署步骤清单：
+- **直接在 Dashboard 发布**：不需要修改 [wrangler.toml](wrangler.toml)，但需要在 Worker 的代码编辑器中提供项目代码。
+- **连接 GitHub 自动发布**：代码从仓库构建，Cloudflare 会读取 [wrangler.toml](wrangler.toml)，需要先填写真实的 KV Namespace ID。
 
-1. 登录 Cloudflare Dashboard
-2. 进入 **Workers & Pages -> Create application**
-3. 创建一个 Worker，并给它起一个名字，例如 `cf-webdav`
-4. 打开 **Settings -> Variables and Bindings**
-5. 点击 **Add binding**，依次添加：
-   - `WEBDAV_BUCKET`：新建或选择一个 R2 Bucket
-   - `WEBDAV_KV`：新建或选择一个 KV Namespace
-   - `DAV_PREFIX`：可选，默认留空
-   - `ENABLE_ACCESS_LOG`：可选，建议设为 `true`
-6. 如果需要自定义管理账号，打开 **Settings -> Secrets**，添加：
-   - `ADMIN_USERNAME`
-   - `ADMIN_PASSWORD`
-7. 保存绑定配置后，点击 **Deploy**，等待发布完成
-8. 打开 `https://你的-worker.workers.dev/__admin`，首次登录使用 `admin / admin123456`
+下面先完成两种方式都需要的资源和 Worker 配置。
 
-> 重要：如果你使用 GitHub 连接部署，Cloudflare 仍会执行 `wrangler deploy` 并读取 [wrangler.toml](wrangler.toml)。Dashboard 中创建的绑定不会自动替换仓库文件里的配置，因此必须先把其中的 `id` 改成真实的 KV Namespace ID；`replace-during-setup` 不能用于部署。
+#### 第 1 步：创建 KV 和 R2
 
-如果你使用 **GitHub 连接部署**，可以在构建设置中填写以下默认命令：
+1. 登录 Cloudflare Dashboard，进入 **Storage & databases -> KV**。
+2. 点击 **Create a namespace**，创建一个 Namespace，例如 `cf-webdav-kv`。
+3. 打开刚创建的 Namespace，复制并保存 **Namespace ID**。GitHub 自动发布时会用到它。
+4. 进入 **Storage & databases -> R2**，点击 **Create bucket**。
+5. 创建一个全局唯一的 Bucket，例如 `cf-webdav-files-xyz789`，并保存 Bucket 名称。
 
-```bash
-# 构建命令（Build command）
-# 留空即可，或者填写：
-npm run typecheck
+这两个资源不需要预先写入数据。Worker 首次运行时会自动写入目录元数据、凭证和会话信息。
 
-# 部署命令（Deploy command）
-npm run deploy
+#### 第 2 步：创建 Worker
+
+1. 进入 **Workers & Pages -> Create application**。
+2. 创建一个 Worker，例如 `cf-webdav`。
+3. 按页面提示完成首次创建。暂时使用默认代码也可以，后面会替换或连接项目代码。
+
+#### 第 3 步：添加绑定和变量
+
+打开 Worker 的 **Settings -> Variables and Bindings**，添加以下配置：
+
+| 类型 | 名称 | 值 |
+| --- | --- | --- |
+| R2 Bucket binding | `WEBDAV_BUCKET` | 第 1 步创建的 R2 Bucket |
+| KV Namespace binding | `WEBDAV_KV` | 第 1 步创建的 KV Namespace |
+| Variable | `DAV_PREFIX` | 留空，或填写例如 `team-files` |
+| Variable | `ENABLE_ACCESS_LOG` | `true` |
+
+如果需要自定义管理员账号，在 **Settings -> Variables and Bindings -> Secrets** 中添加：
+
+| Secret 名称 | 值 |
+| --- | --- |
+| `ADMIN_USERNAME` | 自定义用户名 |
+| `ADMIN_PASSWORD` | 自定义密码 |
+
+#### 第 4 步：发布代码
+
+##### 选项 1：Dashboard 直接发布
+
+如果不想修改 [wrangler.toml](wrangler.toml)，使用 Worker 的 Dashboard 代码编辑器，将项目代码提供给当前 Worker，然后点击 **Deploy**。这种方式的 KV/R2 绑定由 Dashboard 保存，不读取仓库中的 KV 占位 ID。
+
+发布完成后，打开 `https://你的-worker.workers.dev/__admin`，使用默认账号 `admin / admin123456` 登录。首次登录后请立即修改密码。
+
+##### 选项 2：连接 GitHub 自动发布
+
+如果希望每次推送代码后自动部署：
+
+1. 在 Worker 的代码或部署页面选择 **Connect to Git**，连接包含本项目的 GitHub 仓库。
+2. 在仓库的 [wrangler.toml](wrangler.toml) 中，将 `id = "replace-during-setup"` 替换为第 1 步保存的真实 KV Namespace ID。
+3. 确认 `bucket_name` 与第 1 步创建的 R2 Bucket 名称一致。
+4. 提交并推送 [wrangler.toml](wrangler.toml)，重新触发部署。
+5. 构建命令可填写 `npm run typecheck`，部署命令填写 `npm run deploy`。
+
+GitHub 部署时，Dashboard 中创建的绑定不会自动改写仓库配置；如果不想把账号专属的 KV ID 提交到 Git 仓库，请使用上面的 Dashboard 直接发布方式。
+
+#### 第 5 步：验证部署
+
+打开以下地址：
+
+```text
+https://你的-worker.workers.dev/__admin
 ```
 
-> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。只有使用 GitHub 连接部署时，才填写这两条命令，并且需要先完成下面的配置。
+默认登录信息：
 
-如果使用 GitHub 连接部署，请先完成以下配置：
+```text
+用户名：admin
+密码：admin123456
+```
 
-1. 打开 Cloudflare Dashboard -> **Storage & databases -> KV**
-2. 打开实际绑定给 `WEBDAV_KV` 的 Namespace，复制 **Namespace ID**
-3. 将 [wrangler.toml](wrangler.toml) 中的 `id = "replace-during-setup"` 替换为复制的真实 ID
-4. 确认 `bucket_name` 与实际绑定给 `WEBDAV_BUCKET` 的 R2 Bucket 名称一致
-5. 提交并推送 [wrangler.toml](wrangler.toml)，重新触发 GitHub 部署
+登录后可在后台修改账号密码、查看访问日志和恢复回收站文件。也可以执行下面的请求确认 WebDAV 已生效：
 
-如果不想把账号专属的 KV ID 写入 Git 仓库，请不要使用 GitHub 的 `npm run deploy`，改用 Dashboard 的 **Deploy** 按钮，或在本地执行 `npm run deploy:setup`。
-
-> 正确做法：
-> - 方式 A：使用控制台按钮部署，或者让 GitHub 自动部署
-> - 方式 B：在本地先执行 `npm run deploy:setup`，自动写入真实的 KV Namespace ID，再执行 `npm run deploy`
+```bash
+curl -i -u admin:admin123456 -X OPTIONS https://你的-worker.workers.dev/
+curl -i -u admin:admin123456 -X MKCOL https://你的-worker.workers.dev/test-folder
+curl -i -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.workers.dev/
+```
 
 ### 方式 B：本地自动创建资源并部署
 
