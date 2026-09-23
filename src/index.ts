@@ -288,6 +288,25 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (isRoot && url.searchParams.get("action") === "logout") {
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
   }
+  if (url.pathname === "/__admin/register") {
+    if (request.method === "GET") return adminRegisterPage();
+    if (request.method === "POST") {
+      const form = await request.formData();
+      const username = String(form.get("username") || "").trim();
+      const password = String(form.get("password") || "");
+      const confirmPassword = String(form.get("confirmPassword") || "");
+      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return adminRegisterPage("管理员账户格式不正确，密码至少需要 8 位");
+      if (password !== confirmPassword) return adminRegisterPage("两次输入的密码不一致");
+      const admins = await getAdminAccounts(env);
+      if (admins[username]) return adminRegisterPage("管理员账户已存在");
+      if (Object.keys(admins).length >= 10) return adminRegisterPage("管理员账户最多创建 10 个");
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      admins[username] = { username, salt, passwordHash: await hashPassword(password, salt) };
+      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
+      return adminLoginPage("管理员账户已注册，请登录");
+    }
+    return textResponse("Method Not Allowed", 405);
+  }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
     const username = String(form.get("username") ?? "");
@@ -480,7 +499,11 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
 }
 
 function adminLoginPage(error = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form></section></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form><a class="secondary-button inline-button" href="/__admin/register">注册管理员账户</a></section></main>`);
+}
+
+function adminRegisterPage(error = ""): Response {
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>注册管理员账户</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">NEW ADMIN</p><h1>注册管理员账户</h1><p class="muted">创建用于登录管理界面的管理员账户。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/register"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">注册管理员账户</button></form><a class="secondary-button inline-button" href="/">返回登录</a></section></main>`);
 }
 
 async function adminPage(request: Request, env: Env, message = ""): Promise<Response> {
@@ -499,7 +522,8 @@ function htmlResponse(body: string): Response {
     ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">ADMIN ACCOUNT</p><h2>管理员账号</h2></div><span class="icon-badge">03</span></div><p class="muted">管理员账号只用于登录此管理界面，不用于 WebDAV 客户端。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-admin"><label>管理员账户<input name="adminUsername" autocomplete="username" placeholder="例如：admin" required></label><label>管理员密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存管理员账号</button></form><a class="secondary-button inline-button" href="/?view=accounts">管理所有账户</a></section>`
     : "";
   const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
-  return new Response(renderedBody, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+  const withLogout = renderedBody.replace('<span class="status-dot">服务在线</span>', '<span class="status-dot">服务在线</span><a class="text-link" style="color:#dcebe6;margin-left:16px" href="/?action=logout">退出当前账户</a>');
+  return new Response(withLogout, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 function requestPath(request: Request, env: Env): string {
