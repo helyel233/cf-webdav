@@ -6,7 +6,9 @@
 
 支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY` 和 `MOVE`。
 
-默认管理员账号和 WebDAV 账号均为 `admin` / `admin123456`，但两者相互独立。访问 Worker 域名根路径即可进入管理界面；登录后可分别修改管理员账号和 WebDAV 连接信息。
+系统采用“管理员 -> 用户 -> WebDAV 账户”三级管理体系。初始管理员账户为 `admin`，密码为 `admin123456`。管理员只能管理用户及其 WebDAV 账户的元信息，不能查看用户或 WebDAV 账户下的文件；用户只能修改自己的密码，并管理自己名下的 WebDAV 账户和文件。
+
+访问 Worker 域名根路径即可进入管理界面。管理员账户不能在网页注册，新增管理员必须通过 Cloudflare 控制台配置 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`。
 
 支持多管理员：每个管理员最多拥有 2 个 WebDAV 账户。每个 WebDAV 账户拥有独立的文件、日志、限流记录和回收站，管理员只能在管理界面看到自己名下账户的数据。
 
@@ -69,6 +71,19 @@
 
 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 仅用于登录管理界面，不会改变 WebDAV 客户端账号。WebDAV 账号在管理界面中单独配置；如需通过环境变量预设，可使用 `WEBDAV_USERNAME` 和 `WEBDAV_PASSWORD`。
 
+#### 管理员账户初始化与新增
+
+管理员账户必须通过 Cloudflare 控制台创建或配置：
+
+1. 打开 Worker，进入 **Settings -> Variables and Bindings -> Secrets**。
+2. 添加 `ADMIN_USERNAME`，值填写新的管理员账户名；添加 `ADMIN_PASSWORD`，值填写至少 8 位的密码。
+3. 点击 **Save**，然后重新部署 Worker，或在 **Deployments** 中执行 **Redeploy**。
+4. 访问 Worker 根地址，使用刚才配置的管理员账户登录。
+
+首次请求时，Worker 会把这组 Secret 同步为管理员角色。如果 KV 中已有同名用户，该用户会升级为管理员并使用 Secret 中的密码。已有账户会自动迁移：原有的 `admin` 保留管理员角色，其他原“管理员”账户降级为普通用户。管理员登录后可创建、删除用户及其名下 WebDAV 账户，但不能查看文件、日志或回收站内容。
+
+删除 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` Secret 不会删除 KV 中已保存的管理员账户；如需更换管理员，请配置新的 Secret 并重新部署。
+
 #### 第 4 步：发布代码
 
 ##### 选项 1：Dashboard 直接发布
@@ -127,7 +142,7 @@ https://你的-worker.workers.dev/
 密码：admin123456
 ```
 
-登录后可在管理界面分别修改管理员账户和 WebDAV 服务链接、账户、密码，浏览器上传/删除文件，查看访问日志和恢复回收站文件。WebDAV 客户端使用 WebDAV 配置中的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
+管理员登录后可管理用户、创建或删除用户名下的 WebDAV 账户，但不能浏览文件。用户登录后可修改自己的密码、配置 WebDAV 服务链接和密码，浏览器上传/删除文件，查看自己账户的访问日志和回收站。WebDAV 客户端使用对应 WebDAV 账户的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
 
 在管理中心点击“管理所有账户”可以创建管理员和 WebDAV 账户。创建 WebDAV 账户时必须归属于当前管理员；每个管理员最多创建 2 个。打开某个 WebDAV 账户的文件管理后，只能浏览、上传和删除该账户自己的文件。
 
@@ -239,18 +254,18 @@ curl -i -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.wor
 | `DAV_PREFIX` | var | 可选前缀，如 `team-files` |
 | `ENABLE_ACCESS_LOG` | var | 是否启用访问日志，默认 `true` |
 
-如果未显式设置管理员账号或 WebDAV 账号，代码分别使用默认 `admin` / `admin123456` 作为首次引导值。管理界面中保存的两套凭证会分别写入 KV，互不覆盖。
+如果未显式设置管理员账号或 WebDAV 账号，代码使用默认管理员 `admin` / `admin123456` 作为首次引导值。管理员密码只能由管理员自己在管理界面修改；新增管理员必须通过 Cloudflare 控制台设置 Secret。用户和 WebDAV 账户凭证分别写入 KV，互不覆盖。
 
 升级到多账户版本时，旧的单管理员和单 WebDAV 账户会兼容读取，并归属于当前管理员；新建账户后会使用独立的 KV/R2 前缀进行隔离。
 
 ## 管理后台功能
 
 访问 Worker 域名根路径后，可使用：
-- 管理员配置：修改管理界面的账户和密码
-- 连接配置：修改 WebDAV 服务链接、账户和密码
-- 文件管理：浏览、上传、新建目录和删除文件
-- 访问日志：查看请求记录
-- 回收站：查看已删除的目录和文件并恢复
+- 管理员控制台：通过 Cloudflare Secret 初始化管理员，管理用户及其 WebDAV 账户
+- 用户配置：修改自己的密码和 WebDAV 服务链接、账户、密码
+- 文件管理：浏览、上传、新建目录和删除自己的文件
+- 访问日志：查看当前 WebDAV 账户的请求记录
+- 回收站：查看和恢复当前 WebDAV 账户已删除的目录和文件
 
 ## 本地测试命令
 

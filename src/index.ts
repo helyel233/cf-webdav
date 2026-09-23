@@ -156,7 +156,11 @@ interface Credentials {
   salt: string;
 }
 
-interface AdminAccount extends Credentials {}
+type AdminRole = "admin" | "user";
+
+interface AdminAccount extends Credentials {
+  role?: AdminRole;
+}
 
 interface WebdavAccount extends Credentials {
   owner: string;
@@ -191,13 +195,60 @@ async function getAdminCredentials(env: Env): Promise<Credentials> {
 
 async function getAdminAccounts(env: Env): Promise<Record<string, AdminAccount>> {
   const saved = await env.WEBDAV_KV.get(ADMIN_ACCOUNTS_KEY, "json") as Record<string, AdminAccount> | null;
-  if (saved && Object.keys(saved).length) return saved;
+  if (saved && Object.keys(saved).length) {
+    let changed = false;
+    for (const account of Object.values(saved)) {
+      if (!account.role) {
+        account.role = account.username === DEFAULT_USERNAME ? "admin" : "user";
+        changed = true;
+      }
+    }
+    const bootstrapUsername = env.ADMIN_USERNAME?.trim();
+    if (bootstrapUsername) {
+      saved[bootstrapUsername] = {
+        ...(saved[bootstrapUsername] || { username: bootstrapUsername }),
+        username: bootstrapUsername,
+        passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
+        salt: "default-salt",
+        role: "admin",
+      };
+      changed = true;
+    }
+    if (!Object.values(saved).some((account) => account.role === "admin")) {
+      saved[DEFAULT_USERNAME] = {
+        username: DEFAULT_USERNAME,
+        passwordHash: await hashPassword(DEFAULT_PASSWORD, "default-salt"),
+        salt: "default-salt",
+        role: "admin",
+      };
+      changed = true;
+    }
+    if (changed) await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(saved));
+    return saved;
+  }
   const legacy = await env.WEBDAV_KV.get(ADMIN_CREDENTIALS_KEY, "json") as AdminAccount | null;
-  const account = legacy?.username && legacy.passwordHash && legacy.salt ? legacy : {
-    username: env.ADMIN_USERNAME || DEFAULT_USERNAME,
-    passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"), salt: "default-salt",
+  const accounts: Record<string, AdminAccount> = {
+    [DEFAULT_USERNAME]: {
+      username: DEFAULT_USERNAME,
+      passwordHash: await hashPassword(DEFAULT_PASSWORD, "default-salt"),
+      salt: "default-salt",
+      role: "admin",
+    },
   };
-  return { [account.username]: account };
+  if (legacy?.username && legacy.passwordHash && legacy.salt && legacy.username !== DEFAULT_USERNAME) {
+    accounts[legacy.username] = { ...legacy, role: "user" };
+  }
+  const bootstrapUsername = env.ADMIN_USERNAME?.trim();
+  if (bootstrapUsername && !accounts[bootstrapUsername]) {
+    accounts[bootstrapUsername] = {
+      username: bootstrapUsername,
+      passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
+      salt: "default-salt",
+      role: "admin",
+    };
+  }
+  await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
+  return accounts;
 }
 
 async function getWebdavAccounts(env: Env): Promise<Record<string, WebdavAccount>> {
@@ -313,23 +364,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
   }
   if (url.pathname === "/__admin/register") {
-    if (request.method === "GET") return adminRegisterPage();
-    if (request.method === "POST") {
-      const form = await request.formData();
-      const username = String(form.get("username") || "").trim();
-      const password = String(form.get("password") || "");
-      const confirmPassword = String(form.get("confirmPassword") || "");
-      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return adminRegisterPage("管理员账户格式不正确，密码至少需要 8 位");
-      if (password !== confirmPassword) return adminRegisterPage("两次输入的密码不一致");
-      const admins = await getAdminAccounts(env);
-      if (admins[username]) return adminRegisterPage("管理员账户已存在");
-      if (Object.keys(admins).length >= 10) return adminRegisterPage("管理员账户最多创建 10 个");
-      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      admins[username] = { username, salt, passwordHash: await hashPassword(password, salt) };
-      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
-      return adminLoginPage("管理员账户已注册，请登录");
-    }
-    return textResponse("Method Not Allowed", 405);
+    return adminLoginPage("管理员账户只能通过 Cloudflare 控制台配置");
   }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
@@ -343,6 +378,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   }
   const sessionUser_ = await sessionUser(request, env);
   if (!sessionUser_) return adminLoginPage();
+  const sessionAccount = (await getAdminAccounts(env))[sessionUser_];
+  if (sessionAccount?.role === "admin") return superAdminRequest(request, env, sessionAccount);
   const view = url.searchParams.get("view") || "home";
   if (request.method === "POST" && (isRoot || url.pathname === "/__admin")) {
     const form = await request.formData();
@@ -350,18 +387,15 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const adminUsername = sessionUser_;
     const webdavAccounts = await getWebdavAccounts(env);
     const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === adminUsername);
-    if (action === "create-admin") {
-      const username = String(form.get("adminUsername") || "").trim();
-      const password = String(form.get("adminPassword") || "");
-      const admins = await getAdminAccounts(env);
-      if (admins[username]) return await adminPage(request, env, "管理员账户已存在");
-      if (Object.keys(admins).length >= 10) return await adminPage(request, env, "管理员账户最多创建 10 个");
-      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return await adminPage(request, env, "管理员账户格式不正确，密码至少需要 8 位");
+    if (action === "save-user-password") {
+      const password = String(form.get("userPassword") || "");
+      if (password.length < 8) return await adminPage(request, env, "用户密码至少需要 8 位");
+      const account = (await getAdminAccounts(env))[adminUsername];
       const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      admins[username] = { username, salt, passwordHash: await hashPassword(password, salt) };
-      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
-      return await adminPage(request, env, "管理员账户已创建");
+      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify({ ...(await getAdminAccounts(env)), [adminUsername]: { ...account, salt, passwordHash: await hashPassword(password, salt), role: "user" } }));
+      return await adminPage(request, env, "密码已更新");
     }
+    if (action === "create-admin" || action === "save-admin") return textResponse("普通用户无权执行管理员操作", 403);
     if (action === "create-webdav") {
       const username = String(form.get("serviceUsername") || "").trim();
       const password = String(form.get("servicePassword") || "");
@@ -467,9 +501,97 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (view === "logs") return adminLogsPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
   if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
-  if (view === "accounts") return adminAccountsPage(request, env, sessionUser_);
+  if (view === "accounts") return adminPage(request, env);
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
   return adminPage(request, env);
+}
+
+async function superAdminRequest(request: Request, env: Env, currentAdmin: AdminAccount): Promise<Response> {
+  if (request.method !== "POST") return superAdminPage(env, "");
+  const form = await request.formData();
+  const action = String(form.get("action") || "");
+  const accounts = await getAdminAccounts(env);
+  if (action === "save-admin-password") {
+    const password = String(form.get("adminPassword") || "");
+    if (password.length < 8) return superAdminPage(env, "管理员密码至少需要 8 位");
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+    accounts[currentAdmin.username] = { ...currentAdmin, salt, passwordHash: await hashPassword(password, salt), role: "admin" };
+    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
+    return superAdminPage(env, "管理员密码已更新");
+  }
+  if (action === "create-user") {
+    const username = String(form.get("userUsername") || "").trim();
+    const password = String(form.get("userPassword") || "");
+    const confirmPassword = String(form.get("userPasswordConfirm") || "");
+    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return superAdminPage(env, "用户账户格式不正确，密码至少需要 8 位");
+    if (password !== confirmPassword) return superAdminPage(env, "两次输入的密码不一致");
+    if (accounts[username]) return superAdminPage(env, "用户账户已存在");
+    if (Object.keys(accounts).length >= 10) return superAdminPage(env, "账户最多创建 10 个");
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+    accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
+    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
+    return superAdminPage(env, "用户账户已创建");
+  }
+  if (action === "create-webdav-admin") {
+    const owner = String(form.get("userUsername") || "");
+    const username = String(form.get("serviceUsername") || "").trim();
+    const password = String(form.get("servicePassword") || "");
+    const uuid = String(form.get("accountUuid") || "").trim();
+    if (!accounts[owner] || accounts[owner].role === "admin") return superAdminPage(env, "只能为普通用户创建 WebDAV 账户");
+    const webdavAccounts = await getWebdavAccounts(env);
+    const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === owner);
+    if (ownedAccounts.length >= 2) return superAdminPage(env, "每个用户最多拥有 2 个 WebDAV 账户");
+    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return superAdminPage(env, "WebDAV 账户格式不正确，密码至少需要 8 位");
+    if (!/^\d{6}$/.test(uuid)) return superAdminPage(env, "UUID 必须是 6 位数字");
+    if (webdavAccounts[username]) return superAdminPage(env, "WebDAV 账户名已存在");
+    if (Object.values(webdavAccounts).some((account) => account.uuid === uuid)) return superAdminPage(env, "UUID 已存在，请换一个");
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+    const account = { username, owner, uuid, url: "", salt, passwordHash: await hashPassword(password, salt) };
+    account.url = webdavAccountUrl(request, account);
+    webdavAccounts[username] = account;
+    await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
+    return superAdminPage(env, "WebDAV 账户已创建");
+  }
+  if (action === "delete-webdav-admin") {
+    const username = String(form.get("serviceUsername") || "");
+    const webdavAccounts = await getWebdavAccounts(env);
+    const account = webdavAccounts[username];
+    if (!account || !accounts[account.owner] || accounts[account.owner].role === "admin") return superAdminPage(env, "无权删除该 WebDAV 账户");
+    await deleteWebdavAccountData(env, account);
+    delete webdavAccounts[username];
+    await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
+    return superAdminPage(env, "WebDAV 账户及其文件已删除");
+  }
+  if (action === "delete-user") {
+    const username = String(form.get("userUsername") || "");
+    const user = accounts[username];
+    if (!user || user.role === "admin" || username === currentAdmin.username) return superAdminPage(env, "只能删除普通用户账户");
+    const webdavAccounts = await getWebdavAccounts(env);
+    for (const account of Object.values(webdavAccounts)) {
+      if (account.owner === username) {
+        await deleteWebdavAccountData(env, account);
+        delete webdavAccounts[account.username];
+      }
+    }
+    delete accounts[username];
+    await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
+    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
+    return superAdminPage(env, "用户及其 WebDAV 账户已删除");
+  }
+  return superAdminPage(env, "不支持的操作");
+}
+
+async function superAdminPage(env: Env, message: string): Promise<Response> {
+  const accounts = await getAdminAccounts(env);
+  const users = Object.values(accounts).filter((account) => account.role !== "admin");
+  const webdavAccounts = await getWebdavAccounts(env);
+  const userRows = users.map((user) => {
+    const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === user.username);
+    const accountNames = ownedAccounts.map((account) => `${escapeHtml(account.username)}（UUID: ${escapeHtml(account.uuid || "------")}）`).join("、") || "暂无 WebDAV 账户";
+    const accountRows = ownedAccounts.map((account) => `<div class="muted">${escapeHtml(account.username)} · ${escapeHtml(account.uuid || "------")} <form method="post" style="display:inline" onsubmit="return confirm('确定删除此 WebDAV 账户及其全部文件吗？')"><input type="hidden" name="action" value="delete-webdav-admin"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><button class="danger-button" type="submit">删除</button></form></div>`).join("");
+    return `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">USER ACCOUNT</p><h2>${escapeHtml(user.username)}</h2></div><span class="icon-badge">USER</span></div><p class="muted">WebDAV 账户：${accountNames}</p>${accountRows}<form method="post" class="config-form"><input type="hidden" name="action" value="create-webdav-admin"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><label>WebDAV 账户<input name="serviceUsername" required></label><label>密码<input name="servicePassword" type="password" minlength="8" required></label><label>6 位 UUID<input name="accountUuid" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button class="primary-button" type="submit">创建 WebDAV 账户</button></form><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><button class="danger-button" type="submit">删除用户及其全部数据</button></form></article>`;
+  }).join("");
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理员控制台</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>管理员控制台</span></div><div><span class="status-dot">系统管理员</span><a class="text-link" style="color:#dcebe6;margin-left:16px" href="/?action=logout">退出当前账户</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户与账户管理</h1><p class="muted">管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。</p></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">ADMIN PASSWORD</p><h2>修改管理员密码</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="save-admin-password"><label>新密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">保存密码</button></form></article><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">02</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="content-grid"><h2>用户列表</h2>${userRows || '<p class="muted">暂无用户。</p>'}</section></main></body></html>`);
 }
 
 function adminLandingPage(request: Request, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string): Response {
@@ -562,7 +684,7 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
 }
 
 function adminLoginPage(error = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form><a class="secondary-button inline-button" href="/__admin/register">注册管理员账户</a></section></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form></section></main>`);
 }
 
 function adminRegisterPage(error = ""): Response {
@@ -586,7 +708,11 @@ function htmlResponse(body: string): Response {
   const adminForm = body.includes("<title>WebDAV 控制台</title>")
     ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">ADMIN ACCOUNT</p><h2>管理员账号</h2></div><span class="icon-badge">03</span></div><p class="muted">管理员账号只用于登录此管理界面，不用于 WebDAV 客户端。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-admin"><label>管理员账户<input name="adminUsername" autocomplete="username" placeholder="例如：admin" required></label><label>管理员密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存管理员账号</button></form><a class="secondary-button inline-button" href="/?view=accounts">管理所有账户</a></section>`
     : "";
-  const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
+  const userPasswordForm = body.includes("<title>WebDAV 账户中心</title>")
+    ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">USER PASSWORD</p><h2>修改当前用户密码</h2></div></div><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-user-password"><label>新密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">保存密码</button></form></section>`
+    : "";
+  const bodyWithUserPassword = userPasswordForm ? body.replace("</main></body>", `${userPasswordForm}</main></body>`) : body;
+  const renderedBody = adminForm ? bodyWithUserPassword.replace("</main></body>", `${adminForm}</main></body>`) : bodyWithUserPassword;
   const withLogout = renderedBody.replace('<span class="status-dot">服务在线</span>', '<span class="status-dot">服务在线</span><a class="text-link" style="color:#dcebe6;margin-left:16px" href="/?action=logout">退出当前账户</a>');
   const accountFileLink = withLogout.match(/<a class="secondary-button inline-button" href="\/\?view=files&account=([^"]+)">打开此账户文件<\/a>/);
   const withAccountTools = accountFileLink ? withLogout.replace(accountFileLink[0], `${accountFileLink[0]}<a class="secondary-button inline-button" href="/?view=logs&account=${accountFileLink[1]}">访问日志</a><a class="secondary-button inline-button" href="/?view=trash&account=${accountFileLink[1]}">回收站</a><form method="post" action="/?view=account" class="inline-button" onsubmit="return confirm('确定要删除此 WebDAV 账户及其全部文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-webdav"><input type="hidden" name="accountUsername" value="${escapeHtml(decodeURIComponent(accountFileLink[1]))}"><button class="danger-button" type="submit">删除整个账户</button></form>`) : withLogout;
