@@ -8,6 +8,8 @@
 
 默认管理员账号和 WebDAV 账号均为 `admin` / `admin123456`，但两者相互独立。访问 Worker 域名根路径即可进入管理界面；登录后可分别修改管理员账号和 WebDAV 连接信息。
 
+支持多管理员：每个管理员最多拥有 2 个 WebDAV 账户。每个 WebDAV 账户拥有独立的文件、日志、限流记录和回收站，管理员只能在管理界面看到自己名下账户的数据。
+
 新增能力：
 - 访问日志：记录请求方法、路径、状态码、客户端 IP 等，可在后台查看
 - 流量限制：默认每分钟 60 次请求、每小时上传 1GB 上限，超出返回 429
@@ -127,6 +129,8 @@ https://你的-worker.workers.dev/
 
 登录后可在管理界面分别修改管理员账户和 WebDAV 服务链接、账户、密码，浏览器上传/删除文件，查看访问日志和恢复回收站文件。WebDAV 客户端使用 WebDAV 配置中的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
 
+在管理中心点击“管理所有账户”可以创建管理员和 WebDAV 账户。创建 WebDAV 账户时必须归属于当前管理员；每个管理员最多创建 2 个。打开某个 WebDAV 账户的文件管理后，只能浏览、上传和删除该账户自己的文件。
+
 ```bash
 curl -i -u admin:admin123456 -X OPTIONS https://你的-worker.workers.dev/
 curl -i -u admin:admin123456 -X MKCOL https://你的-worker.workers.dev/test-folder
@@ -236,6 +240,8 @@ curl -i -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.wor
 | `ENABLE_ACCESS_LOG` | var | 是否启用访问日志，默认 `true` |
 
 如果未显式设置管理员账号或 WebDAV 账号，代码分别使用默认 `admin` / `admin123456` 作为首次引导值。管理界面中保存的两套凭证会分别写入 KV，互不覆盖。
+
+升级到多账户版本时，旧的单管理员和单 WebDAV 账户会兼容读取，并归属于当前管理员；新建账户后会使用独立的 KV/R2 前缀进行隔离。
 
 ## 管理后台功能
 

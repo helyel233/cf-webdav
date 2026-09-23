@@ -36,6 +36,8 @@ const DIR_PREFIX = "dir:";
 const CREDENTIALS_KEY = "config:credentials";
 const ADMIN_CREDENTIALS_KEY = "config:admin-credentials";
 const SERVICE_CONFIG_KEY = "config:service";
+const ADMIN_ACCOUNTS_KEY = "config:admin-accounts";
+const WEBDAV_ACCOUNTS_KEY = "config:webdav-accounts";
 const SESSION_PREFIX = "session:";
 const LOG_PREFIX = "log:";
 const TRASH_PREFIX = "trash:";
@@ -57,23 +59,21 @@ export default {
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
     if (request.method === "OPTIONS") return optionsResponse();
 
-    let authenticated = false;
     let username = "anonymous";
-    if (await authenticate(request, env)) {
-      authenticated = true;
-      const credentials = await getWebdavCredentials(env);
-      username = credentials.username;
-    } else {
+    const webdavAccount = await authenticate(request, env);
+    if (!webdavAccount) {
       return new Response("Unauthorized", {
         status: 401,
         headers: { "WWW-Authenticate": 'Basic realm="Cloudflare WebDAV"' },
       });
     }
+    username = webdavAccount.username;
+    const scopedEnv = createScopedEnv(env, storageScope(webdavAccount));
 
     // 新增：检查流量限制
-    const rateLimit = await checkRateLimit(env, clientIp, request.method, contentLength);
+    const rateLimit = await checkRateLimit(scopedEnv, clientIp, request.method, contentLength);
     if (!rateLimit.allowed) {
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
+      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
       return new Response("Too Many Requests", {
         status: 429,
         headers: {
@@ -88,31 +88,31 @@ export default {
     try {
       path = requestPath(request, env);
     } catch {
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
+      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
       return textResponse("Bad Request", 400);
     }
 
     let response: Response;
     try {
       switch (request.method) {
-        case "PROPFIND": response = await propfind(request, env, path); break;
-        case "GET": response = await getObject(env, path, false, request); break;
-        case "HEAD": response = await getObject(env, path, true, request); break;
-        case "PUT": response = await putObject(request, env, path); break;
-        case "DELETE": response = await deletePath(env, path); break;
-        case "MKCOL": response = await makeCollection(env, path); break;
-        case "COPY": response = await copyOrMove(request, env, path, false); break;
-        case "MOVE": response = await copyOrMove(request, env, path, true); break;
+        case "PROPFIND": response = await propfind(request, scopedEnv, path); break;
+        case "GET": response = await getObject(scopedEnv, path, false, request); break;
+        case "HEAD": response = await getObject(scopedEnv, path, true, request); break;
+        case "PUT": response = await putObject(request, scopedEnv, path); break;
+        case "DELETE": response = await deletePath(scopedEnv, path); break;
+        case "MKCOL": response = await makeCollection(scopedEnv, path); break;
+        case "COPY": response = await copyOrMove(request, scopedEnv, path, false); break;
+        case "MOVE": response = await copyOrMove(request, scopedEnv, path, true); break;
         default:
           response = textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
       }
     } catch (error) {
       console.error("WebDAV request failed", { method: request.method, path, error });
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
+      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
       return textResponse("Internal Server Error", 500);
     }
 
-    await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
+    await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
     return response;
   },
 };
@@ -136,17 +136,17 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
   await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
 }
 
-async function authenticate(request: Request, env: Env): Promise<boolean> {
-  const credentials = await getWebdavCredentials(env);
+async function authenticate(request: Request, env: Env): Promise<WebdavAccount | null> {
   const header = request.headers.get("Authorization");
-  if (!header?.startsWith("Basic ")) return false;
+  if (!header?.startsWith("Basic ")) return null;
   try {
     const decoded = atob(header.slice(6));
     const separator = decoded.indexOf(":");
-    return separator >= 0 && decoded.slice(0, separator) === credentials.username
-      && await verifyPassword(decoded.slice(separator + 1), credentials.passwordHash, credentials.salt);
+    if (separator < 0) return null;
+    const account = await getWebdavAccountByUsername(env, decoded.slice(0, separator));
+    return account && await verifyPassword(decoded.slice(separator + 1), account.passwordHash, account.salt) ? account : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -156,6 +156,13 @@ interface Credentials {
   salt: string;
 }
 
+interface AdminAccount extends Credentials {}
+
+interface WebdavAccount extends Credentials {
+  owner: string;
+  url: string;
+}
+
 interface ServiceConfig {
   url: string;
   username: string;
@@ -163,23 +170,86 @@ interface ServiceConfig {
 }
 
 async function getWebdavCredentials(env: Env): Promise<Credentials> {
-  const saved = await env.WEBDAV_KV.get(CREDENTIALS_KEY, "json") as Credentials | null;
-  if (saved?.username && saved.passwordHash && saved.salt) return saved;
-  return {
+  const account = await getWebdavAccountByUsername(env, env.WEBDAV_USERNAME || DEFAULT_USERNAME);
+  return account || {
     username: env.WEBDAV_USERNAME || DEFAULT_USERNAME,
-    passwordHash: await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
-    salt: "default-salt",
+    passwordHash: await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, "default-salt"), salt: "default-salt",
   };
 }
 
 async function getAdminCredentials(env: Env): Promise<Credentials> {
-  const saved = await env.WEBDAV_KV.get(ADMIN_CREDENTIALS_KEY, "json") as Credentials | null;
-  if (saved?.username && saved.passwordHash && saved.salt) return saved;
+  const accounts = await getAdminAccounts(env);
+  const first = accounts[DEFAULT_USERNAME] || Object.values(accounts)[0];
+  if (first) return first;
   return {
     username: env.ADMIN_USERNAME || DEFAULT_USERNAME,
     passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
     salt: "default-salt",
   };
+}
+
+async function getAdminAccounts(env: Env): Promise<Record<string, AdminAccount>> {
+  const saved = await env.WEBDAV_KV.get(ADMIN_ACCOUNTS_KEY, "json") as Record<string, AdminAccount> | null;
+  if (saved && Object.keys(saved).length) return saved;
+  const legacy = await env.WEBDAV_KV.get(ADMIN_CREDENTIALS_KEY, "json") as AdminAccount | null;
+  const account = legacy?.username && legacy.passwordHash && legacy.salt ? legacy : {
+    username: env.ADMIN_USERNAME || DEFAULT_USERNAME,
+    passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"), salt: "default-salt",
+  };
+  return { [account.username]: account };
+}
+
+async function getWebdavAccounts(env: Env): Promise<Record<string, WebdavAccount>> {
+  const saved = await env.WEBDAV_KV.get(WEBDAV_ACCOUNTS_KEY, "json") as Record<string, WebdavAccount> | null;
+  if (saved && Object.keys(saved).length) return saved;
+  const legacy = await env.WEBDAV_KV.get(CREDENTIALS_KEY, "json") as Credentials | null;
+  const username = legacy?.username || env.WEBDAV_USERNAME || DEFAULT_USERNAME;
+  const admin = await getAdminCredentials(env);
+  return { [username]: { username, owner: admin.username, url: new URL("https://example.invalid").origin, passwordHash: legacy?.passwordHash || await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, "default-salt"), salt: legacy?.salt || "default-salt" } };
+}
+
+async function getWebdavAccountByUsername(env: Env, username: string): Promise<WebdavAccount | null> {
+  const accounts = await getWebdavAccounts(env);
+  return accounts[username] || null;
+}
+
+function storageScope(account: WebdavAccount): string {
+  return `tenant/${encodeURIComponent(account.owner)}/${encodeURIComponent(account.username)}`;
+}
+
+function createScopedEnv(env: Env, scope: string): Env {
+  const scopedKv = new Proxy(env.WEBDAV_KV, {
+    get(target, property, receiver) {
+      if (property === "get" || property === "put" || property === "delete") {
+        return (...args: unknown[]) => {
+          if (property === "get" || property === "delete") return (target[property as "get" | "delete"] as Function).call(target, `${scope}/kv/${args[0]}`, ...args.slice(1));
+          return target.put(`${scope}/kv/${args[0]}`, args[1], args[2]);
+        };
+      }
+      if (property === "list") return async (options: { prefix?: string; [key: string]: unknown } = {}) => {
+        const base = `${scope}/kv/`;
+        const result = await target.list({ ...options, prefix: `${base}${options.prefix || ""}` });
+        return { ...result, keys: result.keys.map((key) => ({ ...key, name: key.name.slice(base.length) })) };
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const scopedBucket = new Proxy(env.WEBDAV_BUCKET, {
+    get(target, property, receiver) {
+      if (["get", "put", "head", "delete"].includes(String(property))) return (...args: unknown[]) => (target[property as "get" | "put" | "head" | "delete"] as Function).call(target, `${scope}/r2/${args[0]}`, ...args.slice(1));
+      if (property === "list") return async (options: { prefix?: string; [key: string]: unknown } = {}) => {
+        const base = `${scope}/r2/`;
+        const result = await target.list({ ...options, prefix: `${base}${options.prefix || ""}` });
+        return {
+          ...result,
+          objects: result.objects.map((object) => ({ ...object, key: object.key.slice(base.length) })),
+          delimitedPrefixes: result.delimitedPrefixes.map((prefix) => prefix.slice(base.length)),
+        };
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return { ...env, WEBDAV_KV: scopedKv, WEBDAV_BUCKET: scopedBucket };
 }
 
 async function getServiceConfig(request: Request, env: Env): Promise<ServiceConfig> {
@@ -216,10 +286,10 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
-    const credentials = await getAdminCredentials(env);
     const username = String(form.get("username") ?? "");
     const password = String(form.get("password") ?? "");
-    if (username !== credentials.username || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) return adminLoginPage("用户名或密码错误");
+    const credentials = (await getAdminAccounts(env))[username];
+    if (!credentials || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) return adminLoginPage("用户名或密码错误");
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, username, { expirationTtl: SESSION_TTL });
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
@@ -230,7 +300,36 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (request.method === "POST" && (isRoot || url.pathname === "/__admin")) {
     const form = await request.formData();
     const action = String(form.get("action") || "");
+    const adminUsername = sessionUser_;
+    const webdavAccounts = await getWebdavAccounts(env);
+    const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === adminUsername);
+    if (action === "create-admin") {
+      const username = String(form.get("adminUsername") || "").trim();
+      const password = String(form.get("adminPassword") || "");
+      const admins = await getAdminAccounts(env);
+      if (admins[username]) return await adminPage(request, env, "管理员账户已存在");
+      if (Object.keys(admins).length >= 10) return await adminPage(request, env, "管理员账户最多创建 10 个");
+      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return await adminPage(request, env, "管理员账户格式不正确，密码至少需要 8 位");
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      admins[username] = { username, salt, passwordHash: await hashPassword(password, salt) };
+      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
+      return await adminPage(request, env, "管理员账户已创建");
+    }
+    if (action === "create-webdav") {
+      const username = String(form.get("serviceUsername") || "").trim();
+      const password = String(form.get("servicePassword") || "");
+      if (ownedAccounts.length >= 2) return await adminPage(request, env, "每个管理员最多只能拥有 2 个 WebDAV 账户");
+      if (webdavAccounts[username]) return await adminPage(request, env, "WebDAV 账户名已存在，请换一个");
+      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return await adminPage(request, env, "WebDAV 账户格式不正确，密码至少需要 8 位");
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      webdavAccounts[username] = { username, owner: adminUsername, url: new URL(request.url).origin, salt, passwordHash: await hashPassword(password, salt) };
+      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
+      return await adminPage(request, env, "WebDAV 账户已创建");
+    }
     if (action === "save-service") {
+      const accountUsername = String(form.get("accountUsername") || ownedAccounts[0]?.username || "");
+      const account = webdavAccounts[accountUsername];
+      if (!account || account.owner !== adminUsername) return await adminPage(request, env, "无权修改该 WebDAV 账户");
       const service = {
         url: String(form.get("url") || "").trim().replace(/\/+$/, ""),
         username: String(form.get("serviceUsername") || "").trim(),
@@ -239,9 +338,15 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!/^https?:\/\//i.test(service.url)) return await adminPage(request, env, "服务链接必须以 http:// 或 https:// 开头");
       if (!/^[A-Za-z0-9._-]{2,64}$/.test(service.username)) return await adminPage(request, env, "WebDAV 账户须为 2-64 位字母、数字、点、下划线或短横线");
       if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
-      await env.WEBDAV_KV.put(SERVICE_CONFIG_KEY, JSON.stringify(service));
+      account.url = service.url;
       const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username: service.username, salt, passwordHash: await hashPassword(service.password, salt) }));
+      if (service.username !== accountUsername && webdavAccounts[service.username]) return await adminPage(request, env, "WebDAV 账户名已存在，请换一个");
+      delete webdavAccounts[accountUsername];
+      account.username = service.username;
+      account.salt = salt;
+      account.passwordHash = await hashPassword(service.password, salt);
+      webdavAccounts[service.username] = account;
+      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
       return await adminPage(request, env, "服务连接信息已保存");
     }
     if (action === "save-admin") {
@@ -250,10 +355,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return await adminPage(request, env, "管理员账户须为 2-64 位字母、数字、点、下划线或短横线");
       if (password.length < 8) return await adminPage(request, env, "管理员密码至少需要 8 位");
       const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      await env.WEBDAV_KV.put(ADMIN_CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
+      const admins = await getAdminAccounts(env);
+      delete admins[adminUsername];
+      admins[username] = { username, salt, passwordHash: await hashPassword(password, salt) };
+      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
       return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
-    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) return adminFilesAction(request, env, form, sessionUser_);
+    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) {
+      const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
+      if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
+      return adminFilesAction(request, createScopedEnv(env, storageScope(selected)), form, sessionUser_);
+    }
     if (view === "trash" && ["restore", "empty"].includes(action)) {
       if (action === "empty") await emptyTrash(env);
       else await restoreFromTrash(env, String(form.get("path") || ""));
@@ -275,11 +387,23 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
     return view === "logs" ? adminLogsPage(env) : adminPage(request, env);
   }
-  if (view === "logs") return adminLogsPage(env);
-  if (view === "files") return adminFilesPage(request, env);
-  if (view === "trash") return adminTrashPage(env);
+  const ownedAccountList = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === sessionUser_);
+  const requestedAccount = url.searchParams.get("account") || (view === "files" || view === "logs" || view === "trash" ? ownedAccountList[0]?.username : "");
+  const selectedAccount = (await getWebdavAccounts(env))[requestedAccount || ""];
+  if (selectedAccount && selectedAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
+  if (view === "logs") return adminLogsPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
+  if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
+  if (view === "trash") return adminTrashPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
+  if (view === "accounts") return adminAccountsPage(request, env, sessionUser_);
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
   return adminPage(request, env);
+}
+
+async function adminAccountsPage(request: Request, env: Env, adminUsername: string): Promise<Response> {
+  const accounts = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === adminUsername);
+  const rows = accounts.map((account) => `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.username.slice(0, 2).toUpperCase())}</span></div><p class="muted">服务链接：${escapeHtml(account.url)}</p><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" required></label><label>密码<input name="servicePassword" type="password" minlength="8" placeholder="输入新密码" required></label><label>服务链接<input name="url" type="url" value="${escapeHtml(account.url)}" required></label><button class="primary-button" type="submit">保存 WebDAV 账户</button><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></form></article>`).join("");
+  const createForm = accounts.length < 2 ? `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">NEW ACCOUNT</p><h2>创建 WebDAV 账户</h2></div><span class="icon-badge">+</span></div><p class="muted">每个管理员最多拥有 2 个 WebDAV 账户。</p><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="create-webdav"><label>账户<input name="serviceUsername" required></label><label>密码<input name="servicePassword" type="password" minlength="8" required></label><button class="primary-button" type="submit">创建账户</button></form></article>` : "";
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>账号管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ACCOUNT MANAGEMENT</p><h1>账号管理</h1><p class="muted">当前管理员：${escapeHtml(adminUsername)}。每个管理员最多拥有两个 WebDAV 账户。</p></div><a class="text-link" href="/">返回管理中心</a></section><section class="content-grid">${rows}${createForm}</section><section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">NEW ADMIN</p><h2>创建管理员账户</h2></div></div><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="create-admin"><label>管理员账户<input name="adminUsername" required></label><label>管理员密码<input name="adminPassword" type="password" minlength="8" required></label><button class="primary-button" type="submit">创建管理员</button></form></section></main></html>`);
 }
 
 async function sessionUser(request: Request, env: Env): Promise<string | null> {
@@ -328,7 +452,7 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
   return new Response(null, { status: 303, headers: { Location: `/?view=files${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}` } });
 }
 
-async function adminFilesPage(request: Request, env: Env): Promise<Response> {
+async function adminFilesPage(request: Request, env: Env, accountUsername: string): Promise<Response> {
   const url = new URL(request.url);
   let currentPath = "";
   try {
@@ -344,11 +468,11 @@ async function adminFilesPage(request: Request, env: Env): Promise<Response> {
   const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
   const rows = [
-    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td></tr>`] : []),
-    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td></tr>`),
-    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td></tr>`] : []),
+    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td></tr>`),
+    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
   ].join("");
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><a class="text-link inverse" href="/">返回管理中心</a></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="新目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><a class="text-link inverse" href="/">返回管理中心</a></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">账户：${escapeHtml(accountUsername)}　当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="新目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -356,8 +480,11 @@ function adminLoginPage(error = ""): Response {
 }
 
 async function adminPage(request: Request, env: Env, message = ""): Promise<Response> {
-  const service = await getServiceConfig(request, env);
-  const fileCount = (await listAllObjects(env, "")).filter((item) => !item.key.startsWith("__trash/")).length;
+  const adminUsername = await sessionUser(request, env) || DEFAULT_USERNAME;
+  const ownedAccounts = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === adminUsername);
+  const firstAccount = ownedAccounts[0];
+  const service = firstAccount ? { url: firstAccount.url, username: firstAccount.username, password: "" } : await getServiceConfig(request, env);
+  const fileCount = (await Promise.all(ownedAccounts.map((account) => listAllObjects(createScopedEnv(env, storageScope(account)), "")))).flat().filter((item) => !item.key.startsWith("__trash/")).length;
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 控制台</title><style>${ADMIN_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>WebDAV 控制台</span></div><span class="status-dot">服务在线</span></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMIN CONSOLE</p><h1>管理中心</h1><p class="muted">域名首页就是管理界面，集中管理连接信息与文件。</p></div><a class="text-link" href="/">刷新</a></section>${message ? `<div class="notice success">${escapeXml(message)}</div>` : ""}<section class="summary-grid"><article class="summary-card accent"><span class="card-label">服务状态</span><strong>正常运行</strong><span class="card-meta">Cloudflare Worker</span></article><article class="summary-card"><span class="card-label">文件数量</span><strong>${fileCount}</strong><span class="card-meta">R2 文件对象</span></article><article class="summary-card"><span class="card-label">安全策略</span><strong>Basic Auth</strong><span class="card-meta">会话有效期 7 天</span></article></section><section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">WEBDAV CONNECTION</p><h2>WebDAV 连接信息</h2></div><span class="icon-badge">01</span></div><p class="muted">将下面的信息填入 WebDAV 客户端，即可访问文件。密码会保存到 KV，仅在登录后的管理界面显示。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-service"><label>服务链接<input name="url" type="url" value="${escapeHtml(service.url)}" placeholder="https://example.workers.dev" required></label><label>账户<input name="serviceUsername" value="${escapeHtml(service.username)}" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" value="${escapeHtml(service.password)}" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">保存连接信息</button></form></article><article class="config-card"><div class="card-heading"><div><p class="eyebrow">FILES</p><h2>文件管理</h2></div><span class="icon-badge">02</span></div><p class="muted">在浏览器中上传、创建目录和删除文件。</p><a class="primary-button inline-button" href="/?view=files">打开文件管理</a><div class="tool-list"><a class="tool-row" href="/?view=logs"><span><strong>访问日志</strong><small>查看请求、状态码与客户端信息</small></span><span class="arrow">→</span></a><a class="tool-row" href="/?view=trash"><span><strong>回收站</strong><small>恢复误删文件，或清空过期内容</small></span><span class="arrow">→</span></a></div></article></section><section class="info-strip"><span class="info-icon">i</span><span>WebDAV 地址：${escapeHtml(service.url)}　账户：${escapeHtml(service.username)}　密码：已保存</span></section></main></body></html>`);
 }
 
@@ -365,7 +492,7 @@ const ADMIN_CSS = `:root{font-family:ui-sans-serif,system-ui,-apple-system,Blink
 
 function htmlResponse(body: string): Response {
   const adminForm = body.includes("<title>WebDAV 控制台</title>")
-    ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">ADMIN ACCOUNT</p><h2>管理员账号</h2></div><span class="icon-badge">03</span></div><p class="muted">管理员账号只用于登录此管理界面，不用于 WebDAV 客户端。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-admin"><label>管理员账户<input name="adminUsername" autocomplete="username" placeholder="例如：admin" required></label><label>管理员密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存管理员账号</button></form></section>`
+    ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">ADMIN ACCOUNT</p><h2>管理员账号</h2></div><span class="icon-badge">03</span></div><p class="muted">管理员账号只用于登录此管理界面，不用于 WebDAV 客户端。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-admin"><label>管理员账户<input name="adminUsername" autocomplete="username" placeholder="例如：admin" required></label><label>管理员密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存管理员账号</button></form><a class="secondary-button inline-button" href="/?view=accounts">管理所有账户</a></section>`
     : "";
   const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
   return new Response(renderedBody, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
@@ -628,7 +755,6 @@ async function listChildren(env: Env, path: string): Promise<Array<{ path: strin
   }
   return [...new Map(result.map((entry) => [entry.path, entry])).values()];
 }
-
 async function hasChildren(env: Env, path: string): Promise<boolean> {
   return (await listChildren(env, path)).length > 0;
 }
