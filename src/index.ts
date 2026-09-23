@@ -378,6 +378,15 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
       return await adminPage(request, env, "WebDAV 账户已创建");
     }
+    if (action === "delete-webdav") {
+      const accountUsername = String(form.get("accountUsername") || "");
+      const account = webdavAccounts[accountUsername];
+      if (!account || account.owner !== adminUsername) return textResponse("无权删除该 WebDAV 账户", 403);
+      await deleteWebdavAccountData(env, account);
+      delete webdavAccounts[accountUsername];
+      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
+      return await adminPage(request, env, "WebDAV 账户及其全部文件已删除");
+    }
     if (action === "save-service") {
       const accountUsername = String(form.get("accountUsername") || ownedAccounts[0]?.username || "");
       const account = webdavAccounts[accountUsername];
@@ -545,11 +554,11 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
   const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
   const rows = [
-    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td></tr>`] : []),
-    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td></tr>`),
-    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
+    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`),
+    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td>${formatDateTime(file.uploaded)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
   ].join("");
-    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><a class="text-link inverse" href="/">返回管理中心</a></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">账户：${escapeHtml(accountUsername)}　当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="新目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><a class="text-link inverse" href="/">返回管理中心</a></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">账户：${escapeHtml(accountUsername)}　当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="新目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -580,7 +589,7 @@ function htmlResponse(body: string): Response {
   const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
   const withLogout = renderedBody.replace('<span class="status-dot">服务在线</span>', '<span class="status-dot">服务在线</span><a class="text-link" style="color:#dcebe6;margin-left:16px" href="/?action=logout">退出当前账户</a>');
   const accountFileLink = withLogout.match(/<a class="secondary-button inline-button" href="\/\?view=files&account=([^"]+)">打开此账户文件<\/a>/);
-  const withAccountTools = accountFileLink ? withLogout.replace(accountFileLink[0], `${accountFileLink[0]}<a class="secondary-button inline-button" href="/?view=logs&account=${accountFileLink[1]}">访问日志</a><a class="secondary-button inline-button" href="/?view=trash&account=${accountFileLink[1]}">回收站</a>`) : withLogout;
+  const withAccountTools = accountFileLink ? withLogout.replace(accountFileLink[0], `${accountFileLink[0]}<a class="secondary-button inline-button" href="/?view=logs&account=${accountFileLink[1]}">访问日志</a><a class="secondary-button inline-button" href="/?view=trash&account=${accountFileLink[1]}">回收站</a><form method="post" action="/?view=account" class="inline-button" onsubmit="return confirm('确定要删除此 WebDAV 账户及其全部文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-webdav"><input type="hidden" name="accountUsername" value="${escapeHtml(decodeURIComponent(accountFileLink[1]))}"><button class="danger-button" type="submit">删除整个账户</button></form>`) : withLogout;
   return new Response(withAccountTools, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
@@ -870,6 +879,13 @@ async function listAllKV(env: Env, prefix: string): Promise<string[]> {
   return result;
 }
 
+async function deleteWebdavAccountData(env: Env, account: WebdavAccount): Promise<void> {
+  const scopedEnv = createScopedEnv(env, storageScope(account));
+  const [objects, keys] = await Promise.all([listAllObjects(scopedEnv, ""), listAllKV(scopedEnv, "")]);
+  for (const object of objects) await scopedEnv.WEBDAV_BUCKET.delete(object.key);
+  for (const key of keys) await scopedEnv.WEBDAV_KV.delete(key);
+}
+
 async function deleteMetadataUnder(env: Env, path: string): Promise<void> {
   const [files, dirs] = await Promise.all([listAllKV(env, META_PREFIX), listAllKV(env, DIR_PREFIX)]);
   const prefix = `${path}/`;
@@ -975,6 +991,10 @@ function formatBytes(bytes: number): string {
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
 }
 
+function formatDateTime(value: Date | string): string {
+  return new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+}
+
 const LOGS_CSS = `
 table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e1e4e8}
@@ -1014,7 +1034,7 @@ async function adminTrashPage(env: Env, accountUsername: string): Promise<Respon
   trashItems.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
 
   const trashRows = trashItems.map(item => {
-    const time = new Date(item.deletedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+    const time = formatDateTime(item.deletedAt);
     const path = escapeXml(item.originalPath);
     const type = item.isDirectory ? "目录" : "文件";
     const size = item.size ? formatBytes(item.size) : "-";
