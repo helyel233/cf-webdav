@@ -779,14 +779,29 @@ function optionsResponse(): Response {
 
 async function getObject(env: Env, path: string, head: boolean, request: Request): Promise<Response> {
   if (!path) return textResponse("A directory cannot be downloaded", 405);
-  const object = await env.WEBDAV_BUCKET.get(r2Key(path), { range: request.headers });
+  const rangeHeader = request.headers.get("Range");
+  const object = rangeHeader
+    ? await env.WEBDAV_BUCKET.get(r2Key(path), { range: request.headers })
+    : await env.WEBDAV_BUCKET.get(r2Key(path));
   if (!object) return textResponse("Not Found", 404);
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("ETag", object.httpEtag);
   headers.set("Accept-Ranges", "bytes");
   headers.set("Content-Length", String(object.size));
-  return new Response(head ? null : object.body, { headers });
+  let status = 200;
+  if (rangeHeader && object.range) {
+    const fullObject = await env.WEBDAV_BUCKET.head(r2Key(path));
+    if (fullObject) {
+      const range = object.range;
+      const start = "suffix" in range
+        ? Math.max(0, fullObject.size - object.size)
+        : range.offset ?? 0;
+      headers.set("Content-Range", `bytes ${start}-${start + object.size - 1}/${fullObject.size}`);
+      status = 206;
+    }
+  }
+  return new Response(head ? null : object.body, { status, headers });
 }
 
 async function putObject(request: Request, env: Env, path: string): Promise<Response> {
