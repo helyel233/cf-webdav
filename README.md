@@ -6,7 +6,7 @@
 
 支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY` 和 `MOVE`。
 
-默认首次登录账号为 `admin` / `admin123456`，登录 `/__admin` 后可修改用户名和密码，更新后的凭证哈希保存在 KV 中。
+默认首次登录账号为 `admin` / `admin123456`，访问 Worker 域名根路径即可进入管理界面；登录后可修改 WebDAV 连接信息，更新后的凭证哈希保存在 KV 中。
 
 新增能力：
 - 访问日志：记录请求方法、路径、状态码、客户端 IP 等，可在后台查看
@@ -87,7 +87,7 @@
 
 粘贴代码后，确认第 3 步中的 `WEBDAV_BUCKET` 和 `WEBDAV_KV` 绑定已经保存，再点击 **Deploy**。这种方式的 KV/R2 绑定由 Dashboard 保存，不读取仓库中的 KV 占位 ID。
 
-发布完成后，打开 `https://你的-worker.workers.dev/__admin`，使用默认账号 `admin / admin123456` 登录。首次登录后请立即修改密码。
+发布完成后，打开 `https://你的-worker.workers.dev/`，使用默认账号 `admin / admin123456` 登录。首次登录后请立即修改 WebDAV 连接信息。
 
 ##### 选项 2：连接 GitHub 自动发布
 
@@ -102,7 +102,7 @@
   - **Deploy command**：`npm run deploy`
   - **Root directory**：留空（本项目的 `package.json` 在仓库根目录）
 6. 点击 **Save and Deploy**、**Deploy** 或页面上的同名确认按钮，开始第一次构建和发布。Cloudflare 会从选定分支拉取代码，安装依赖，执行构建命令，再执行部署命令。
-7. 打开 **Deployments** 查看构建日志。显示部署成功后，复制 Worker 的 `workers.dev` 地址，访问 `/__admin` 验证。
+7. 打开 **Deployments** 查看构建日志。显示部署成功后，复制 Worker 的 `workers.dev` 地址，访问根路径验证管理界面。
 
 连接完成后的日常发布方式是：修改代码并推送到刚才选择的部署分支，Cloudflare 会自动创建新的部署。也可以在 **Deployments** 中打开某次历史部署，使用页面提供的 **Retry deployment** 或 **Redeploy** 重新发布；具体按钮名称会因 Dashboard 版本而略有不同。
 
@@ -110,10 +110,10 @@ GitHub 部署时，Dashboard 中创建的 KV/R2 绑定不会自动改写仓库�
 
 #### 第 5 步：验证部署
 
-打开以下地址：
+打开 Worker 域名根地址，管理界面无需添加 `/__admin`：
 
 ```text
-https://你的-worker.workers.dev/__admin
+https://你的-worker.workers.dev/
 ```
 
 默认登录信息：
@@ -123,7 +123,7 @@ https://你的-worker.workers.dev/__admin
 密码：admin123456
 ```
 
-登录后可在后台修改账号密码、查看访问日志和恢复回收站文件。也可以执行下面的请求确认 WebDAV 已生效：
+登录后可在管理界面修改 WebDAV 服务链接、账户和密码，浏览器上传/删除文件，查看访问日志和恢复回收站文件。WebDAV 客户端使用管理界面中显示的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
 
 ```bash
 curl -i -u admin:admin123456 -X OPTIONS https://你的-worker.workers.dev/
@@ -199,7 +199,7 @@ npm run typecheck
 打开：
 
 ```text
-https://你的-worker.workers.dev/__admin
+https://你的-worker.workers.dev/
 ```
 
 首次登录使用：
@@ -235,8 +235,9 @@ curl -i -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.wor
 
 ## 管理后台功能
 
-访问 `/__admin` 后，可使用：
-- 账号设置：修改 WebDAV 用户名和密码
+访问 Worker 域名根路径后，可使用：
+- 连接配置：修改 WebDAV 服务链接、账户和密码
+- 文件管理：浏览、上传、新建目录和删除文件
 - 访问日志：查看请求记录
 - 回收站：查看已删除的目录和文件并恢复
 

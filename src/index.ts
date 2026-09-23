@@ -32,6 +32,7 @@ const METHODS = ["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL",
 const META_PREFIX = "meta:";
 const DIR_PREFIX = "dir:";
 const CREDENTIALS_KEY = "config:credentials";
+const SERVICE_CONFIG_KEY = "config:service";
 const SESSION_PREFIX = "session:";
 const LOG_PREFIX = "log:";
 const TRASH_PREFIX = "trash:";
@@ -49,6 +50,7 @@ export default {
     const userAgent = request.headers.get("User-Agent") || "";
     const contentLength = parseInt(request.headers.get("Content-Length") || "0");
 
+    if (pathname === "/" && request.method === "GET") return adminRequest(request, env);
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
     if (request.method === "OPTIONS") return optionsResponse();
 
@@ -139,7 +141,7 @@ async function authenticate(request: Request, env: Env): Promise<boolean> {
     const decoded = atob(header.slice(6));
     const separator = decoded.indexOf(":");
     return separator >= 0 && decoded.slice(0, separator) === credentials.username
-      && await verifyPassword(decoded.slice(separator + 1), credentials.passwordHash);
+      && await verifyPassword(decoded.slice(separator + 1), credentials.passwordHash, credentials.salt);
   } catch {
     return false;
   }
@@ -151,6 +153,12 @@ interface Credentials {
   salt: string;
 }
 
+interface ServiceConfig {
+  url: string;
+  username: string;
+  password: string;
+}
+
 async function getCredentials(env: Env): Promise<Credentials> {
   const saved = await env.WEBDAV_KV.get(CREDENTIALS_KEY, "json") as Credentials | null;
   if (saved?.username && saved.passwordHash && saved.salt) return saved;
@@ -158,6 +166,15 @@ async function getCredentials(env: Env): Promise<Credentials> {
     username: env.ADMIN_USERNAME || DEFAULT_USERNAME,
     passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
     salt: "default-salt",
+  };
+}
+
+async function getServiceConfig(request: Request, env: Env): Promise<ServiceConfig> {
+  const saved = await env.WEBDAV_KV.get(SERVICE_CONFIG_KEY, "json") as Partial<ServiceConfig> | null;
+  return {
+    url: saved?.url || new URL(request.url).origin,
+    username: saved?.username || env.ADMIN_USERNAME || DEFAULT_USERNAME,
+    password: saved?.password || env.ADMIN_PASSWORD || DEFAULT_PASSWORD,
   };
 }
 
@@ -180,6 +197,10 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 async function adminRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  const isRoot = url.pathname === "/";
+  if (isRoot && url.searchParams.get("action") === "logout") {
+    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+  }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
     const credentials = await getCredentials(env);
@@ -188,27 +209,57 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     if (username !== credentials.username || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) return adminLoginPage("用户名或密码错误");
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, username, { expirationTtl: SESSION_TTL });
-    return new Response(null, { status: 303, headers: { Location: "/__admin", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
+    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
   }
   const sessionUser_ = await sessionUser(request, env);
   if (!sessionUser_) return adminLoginPage();
+  const view = url.searchParams.get("view") || "home";
+  if (request.method === "POST" && (isRoot || url.pathname === "/__admin")) {
+    const form = await request.formData();
+    const action = String(form.get("action") || "");
+    if (action === "save-service") {
+      const service = {
+        url: String(form.get("url") || "").trim().replace(/\/+$/, ""),
+        username: String(form.get("serviceUsername") || "").trim(),
+        password: String(form.get("servicePassword") || ""),
+      };
+      if (!/^https?:\/\//i.test(service.url)) return await adminPage(request, env, "服务链接必须以 http:// 或 https:// 开头");
+      if (!/^[A-Za-z0-9._-]{2,64}$/.test(service.username)) return await adminPage(request, env, "WebDAV 账户须为 2-64 位字母、数字、点、下划线或短横线");
+      if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
+      await env.WEBDAV_KV.put(SERVICE_CONFIG_KEY, JSON.stringify(service));
+      const current = await getCredentials(env);
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username: service.username, salt, passwordHash: await hashPassword(service.password, salt) }));
+      if (current.username !== service.username) return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+      return await adminPage(request, env, "服务连接信息已保存");
+    }
+    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) return adminFilesAction(request, env, form);
+    if (view === "trash" && ["restore", "empty"].includes(action)) {
+      if (action === "empty") await emptyTrash(env);
+      else await restoreFromTrash(env, String(form.get("path") || ""));
+      return new Response(null, { status: 303, headers: { Location: "/?view=trash" } });
+    }
+  }
   if (url.pathname === "/__admin/account" && request.method === "POST") {
     const form = await request.formData();
     const username = String(form.get("username") ?? "").trim();
     const password = String(form.get("password") ?? "");
-    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return adminPage("用户名须为 2-64 位字母、数字、点、下划线或短横线");
-    if (password.length < 8) return adminPage("密码至少需要 8 位");
+    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return adminPage(request, env, "用户名须为 2-64 位字母、数字、点、下划线或短横线");
+    if (password.length < 8) return adminPage(request, env, "密码至少需要 8 位");
     const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
     await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
-    return adminPage("账号已更新，新的 WebDAV 凭证已生效");
+    return adminPage(request, env, "账号已更新，新的 WebDAV 凭证已生效");
   }
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
-    return adminLogsPage(env);
+    return view === "logs" ? adminLogsPage(env) : adminPage(request, env);
   }
+  if (view === "logs") return adminLogsPage(env);
+  if (view === "files") return adminFilesPage(request, env);
+  if (view === "trash") return adminTrashPage(env);
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
-  return adminPage();
+  return adminPage(request, env);
 }
 
 async function sessionUser(request: Request, env: Env): Promise<string | null> {
@@ -216,12 +267,63 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
   return cookie ? env.WEBDAV_KV.get(`${SESSION_PREFIX}${cookie}`) : null;
 }
 
-function adminLoginPage(error = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和回收站。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form></section></main>`);
+function adminPath(value: string): string {
+  const path = value.trim().replace(/^\/+|\/+$/g, "");
+  if (path.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid path");
+  return path;
 }
 
-function adminPage(message = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 控制台</title><style>${ADMIN_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>WebDAV 控制台</span></div><span class="status-dot">服务在线</span></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMIN CONSOLE</p><h1>管理中心</h1><p class="muted">集中管理访问凭证与存储服务。</p></div><a class="text-link" href="/__admin/logout">退出登录</a></section>${message ? `<div class="notice success">${escapeXml(message)}</div>` : ""}<section class="summary-grid"><article class="summary-card accent"><span class="card-label">服务状态</span><strong>正常运行</strong><span class="card-meta">Cloudflare Worker</span></article><article class="summary-card"><span class="card-label">存储后端</span><strong>R2 + KV</strong><span class="card-meta">文件与元数据已绑定</span></article><article class="summary-card"><span class="card-label">安全策略</span><strong>Basic Auth</strong><span class="card-meta">会话有效期 7 天</span></article></section><section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">ACCOUNT</p><h2>账号配置</h2></div><span class="icon-badge">01</span></div><p class="muted">修改后，WebDAV 客户端需要使用新的用户名和密码重新连接。</p><form method="post" action="/__admin/account" class="config-form"><label>新用户名<input name="username" autocomplete="username" placeholder="例如：admin" required></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存账号</button></form></article><article class="config-card"><div class="card-heading"><div><p class="eyebrow">TOOLS</p><h2>运维工具</h2></div><span class="icon-badge">02</span></div><div class="tool-list"><a class="tool-row" href="/__admin/logs"><span><strong>访问日志</strong><small>查看请求、状态码与客户端信息</small></span><span class="arrow">→</span></a><a class="tool-row" href="/__admin/trash"><span><strong>回收站</strong><small>恢复误删文件，或清空过期内容</small></span><span class="arrow">→</span></a></div></article></section><section class="info-strip"><span class="info-icon">i</span><span>首次登录使用默认账号后，请立即修改密码。访问日志默认保留 30 天。</span></section></main></body></html>`);
+async function adminFilesAction(request: Request, env: Env, form: FormData): Promise<Response> {
+  const action = String(form.get("action") || "");
+  const currentPath = adminPath(String(form.get("currentPath") || ""));
+  try {
+    if (action === "upload") {
+      const file = form.get("file");
+      if (!(file instanceof File) || !file.name) return textResponse("请选择文件", 400);
+      const path = adminPath(`${currentPath ? `${currentPath}/` : ""}${file.name}`);
+      await env.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
+      await env.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
+    } else if (action === "mkdir") {
+      const name = String(form.get("name") || "");
+      await makeCollection(env, adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`));
+    } else if (action === "delete") {
+      await deletePath(env, adminPath(String(form.get("path") || "")));
+    }
+  } catch (error) {
+    return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
+  }
+  return new Response(null, { status: 303, headers: { Location: `/?view=files${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}` } });
+}
+
+async function adminFilesPage(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  let currentPath = "";
+  try {
+    currentPath = adminPath(url.searchParams.get("path") || "");
+  } catch {
+    return textResponse("Invalid path", 400);
+  }
+  const prefix = currentPath ? `${currentPath}/` : "";
+  const listed = await env.WEBDAV_BUCKET.list({ prefix, delimiter: "/" });
+  const directories = listed.delimitedPrefixes.map((item) => item.slice(0, -1));
+  const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
+  const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+  const rows = [
+    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td></tr>`] : []),
+    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td></tr>`),
+    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+  ].join("");
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><a class="text-link inverse" href="/">返回管理中心</a></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="新目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
+}
+
+function adminLoginPage(error = ""): Response {
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录管理后台</button></form></section></main>`);
+}
+
+async function adminPage(request: Request, env: Env, message = ""): Promise<Response> {
+  const service = await getServiceConfig(request, env);
+  const fileCount = (await listAllObjects(env, "")).filter((item) => !item.key.startsWith("__trash/")).length;
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 控制台</title><style>${ADMIN_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>WebDAV 控制台</span></div><span class="status-dot">服务在线</span></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMIN CONSOLE</p><h1>管理中心</h1><p class="muted">域名首页就是管理界面，集中管理连接信息与文件。</p></div><a class="text-link" href="/">刷新</a></section>${message ? `<div class="notice success">${escapeXml(message)}</div>` : ""}<section class="summary-grid"><article class="summary-card accent"><span class="card-label">服务状态</span><strong>正常运行</strong><span class="card-meta">Cloudflare Worker</span></article><article class="summary-card"><span class="card-label">文件数量</span><strong>${fileCount}</strong><span class="card-meta">R2 文件对象</span></article><article class="summary-card"><span class="card-label">安全策略</span><strong>Basic Auth</strong><span class="card-meta">会话有效期 7 天</span></article></section><section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">WEBDAV CONNECTION</p><h2>WebDAV 连接信息</h2></div><span class="icon-badge">01</span></div><p class="muted">将下面的信息填入 WebDAV 客户端，即可访问文件。密码会保存到 KV，仅在登录后的管理界面显示。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-service"><label>服务链接<input name="url" type="url" value="${escapeHtml(service.url)}" placeholder="https://example.workers.dev" required></label><label>账户<input name="serviceUsername" value="${escapeHtml(service.username)}" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" value="${escapeHtml(service.password)}" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">保存连接信息</button></form></article><article class="config-card"><div class="card-heading"><div><p class="eyebrow">FILES</p><h2>文件管理</h2></div><span class="icon-badge">02</span></div><p class="muted">在浏览器中上传、创建目录和删除文件。</p><a class="primary-button inline-button" href="/?view=files">打开文件管理</a><div class="tool-list"><a class="tool-row" href="/?view=logs"><span><strong>访问日志</strong><small>查看请求、状态码与客户端信息</small></span><span class="arrow">→</span></a><a class="tool-row" href="/?view=trash"><span><strong>回收站</strong><small>恢复误删文件，或清空过期内容</small></span><span class="arrow">→</span></a></div></article></section><section class="info-strip"><span class="info-icon">i</span><span>WebDAV 地址：${escapeHtml(service.url)}　账户：${escapeHtml(service.username)}　密码：已保存</span></section></main></body></html>`);
 }
 
 const ADMIN_CSS = `:root{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17212b;background:#eef2f1}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%)}a{color:inherit;text-decoration:none}.topbar{background:#183b3f;color:#f4f8f5}.topbar-inner{max-width:1120px;margin:auto;padding:18px 28px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.01em}.brand-mark{display:grid;place-items:center;width:42px;height:42px;background:#e8b35a;color:#183b3f;font-size:13px;font-weight:900;letter-spacing:-.06em}.brand-mark.small{width:30px;height:30px;font-size:10px}.status-dot{font-size:13px;color:#c4e3cf}.status-dot:before{content:"";display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:#6bc58d}.dashboard{max-width:1120px;margin:0 auto;padding:54px 28px 72px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:32px}.eyebrow{margin:0 0 9px;color:#8a6940;font-size:11px;font-weight:800;letter-spacing:.16em}.page-heading h1{margin:0;font-size:clamp(30px,5vw,48px);letter-spacing:-.04em}.muted{color:#667578;line-height:1.6}.text-link{color:#32656a;font-size:14px;font-weight:700}.summary-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}.summary-card,.config-card{background:rgba(255,255,255,.82);border:1px solid #d7e0dc;box-shadow:0 12px 30px rgba(31,61,57,.06)}.summary-card{min-height:132px;padding:22px}.summary-card.accent{border-top:3px solid #d79b41}.card-label{display:block;margin-bottom:20px;color:#71807e;font-size:12px;font-weight:700}.summary-card strong{display:block;font-size:22px;letter-spacing:-.02em}.card-meta{display:block;margin-top:8px;color:#84918f;font-size:13px}.content-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.config-card{padding:28px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:8px}.card-heading h2{margin:0;font-size:22px;letter-spacing:-.03em}.icon-badge{display:grid;place-items:center;width:32px;height:32px;background:#eef3ee;color:#8a6940;font-size:11px;font-weight:800}.config-form{margin-top:25px}.config-form label{display:block;margin:17px 0 6px;font-size:13px;font-weight:700}.config-form input{display:block;width:100%;margin-top:7px;padding:13px 14px;border:1px solid #cbd7d3;border-radius:2px;background:#fbfcfa;color:#17212b;font:inherit;outline:none}.config-form input:focus{border-color:#4c8581;box-shadow:0 0 0 3px rgba(76,133,129,.14)}.primary-button{margin-top:20px;padding:12px 18px;border:0;border-radius:2px;background:#d79b41;color:#183b3f;font:inherit;font-weight:800;cursor:pointer}.primary-button:hover{background:#e5ae59}.tool-list{margin-top:17px;border-top:1px solid #e0e7e3}.tool-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 0;border-bottom:1px solid #e0e7e3}.tool-row strong,.tool-row small{display:block}.tool-row small{margin-top:5px;color:#71807e;font-size:13px}.arrow{color:#397277;font-size:22px}.info-strip{display:flex;align-items:center;gap:11px;margin-top:22px;padding:16px 19px;background:#e7f0eb;color:#45625d;font-size:13px;line-height:1.5}.info-icon{display:grid;place-items:center;flex:none;width:20px;height:20px;border:1px solid #70968b;border-radius:50%;font-size:12px}.notice{margin:-12px 0 22px;padding:13px 16px;background:#e7f4eb;border-left:3px solid #3d9368}.success{color:#176b48}.error{margin:18px 0;padding:11px 13px;background:#fff0ee;color:#a43f35}.login-shell{display:grid;place-items:center;min-height:100vh;padding:24px}.login-panel{width:min(100%,420px);padding:42px;background:rgba(255,255,255,.9);border:1px solid #d7e0dc;box-shadow:0 18px 50px rgba(31,61,57,.12)}.login-panel h1{margin:0;font-size:32px;letter-spacing:-.04em}.login-panel .muted{margin:10px 0 28px}.login-panel label{display:block;margin:17px 0 6px;font-size:13px;font-weight:700}.login-panel input{display:block;width:100%;margin-top:7px;padding:13px 14px;border:1px solid #cbd7d3;border-radius:2px;background:#fbfcfa;color:#17212b;font:inherit}.login-panel .primary-button{width:100%;margin-top:25px}@media(max-width:720px){.topbar-inner,.dashboard{padding-left:20px;padding-right:20px}.dashboard{padding-top:36px}.page-heading{align-items:flex-start;flex-direction:column}.summary-grid,.content-grid{grid-template-columns:1fr}.config-card{padding:22px}}`;
@@ -528,6 +630,10 @@ function escapeXml(value: string): string {
   return value.replace(/[<>&'\"]/g, (character) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[character] ?? character);
 }
 
+function escapeHtml(value: string): string {
+  return escapeXml(value);
+}
+
 function textResponse(body: string, status: number, extraHeaders: Record<string, string> = {}): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", ...extraHeaders } });
 }
@@ -605,7 +711,7 @@ async function adminLogsPage(env: Env): Promise<Response> {
     return `<tr><td>${time}</td><td><span class="method ${method}">${method}</span></td><td class="path">${path}</td><td><span class="status ${statusClass}">${status}</span></td><td>${size}</td><td>${ip}</td><td>${user}</td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><main><h1>访问日志</h1><p>最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）</p><table><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || '<tr><td colspan="7">暂无日志</td></tr>'}</tbody></table><p><a href="/__admin">← 返回设置</a></p></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><main class="dashboard"><h1>访问日志</h1><p>最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）</p><table><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || '<tr><td colspan="7">暂无日志</td></tr>'}</tbody></table><p><a href="/">← 返回管理中心</a></p></main>`);
 }
 
 function formatBytes(bytes: number): string {
@@ -661,7 +767,7 @@ async function adminTrashPage(env: Env): Promise<Response> {
     return `<tr><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><main><h1>回收站</h1><p>已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p><table><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table>${trashItems.length > 0 ? '<form method="post" class="empty-form"><input type="hidden" name="action" value="empty"><button type="submit" class="empty-btn" onclick="return confirm(\'确定要清空回收站吗？此操作不可恢复！\')">清空回收站</button></form>' : ""}<p><a href="/__admin">← 返回设置</a></p></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><main class="dashboard"><h1>回收站</h1><p>已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p><table><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table>${trashItems.length > 0 ? '<form method="post" action="/?view=trash" class="empty-form"><input type="hidden" name="action" value="empty"><button type="submit" class="empty-btn" onclick="return confirm(\'确定要清空回收站吗？此操作不可恢复！\')">清空回收站</button></form>' : ""}<p><a href="/">← 返回管理中心</a></p></main>`);
 }
 
 const TRASH_CSS = `
@@ -675,4 +781,8 @@ th{background:#f6f8fa;font-weight:600}
 .empty-btn:hover{background:#b71c1c}
 a{color:#1769aa;text-decoration:none}
 a:hover{text-decoration:underline}
+`;
+
+const FILES_CSS = `
+.inverse{color:#dcebe6}.file-actions{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px}.file-actions form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.file-actions input[type=file],.mkdir-form input{padding:11px;border:1px solid #cbd7d3;background:#fff;font:inherit}.secondary-button{padding:12px 18px;border:1px solid #397277;border-radius:2px;background:#fff;color:#285b60;font:inherit;font-weight:800;cursor:pointer}.inline-button{display:inline-block;margin:12px 0 18px}.file-table-wrap{overflow-x:auto;background:rgba(255,255,255,.82);border:1px solid #d7e0dc}.file-table-wrap table{width:100%;border-collapse:collapse;min-width:640px}.file-table-wrap th,.file-table-wrap td{padding:15px 18px;text-align:left;border-bottom:1px solid #e0e7e3}.file-table-wrap th{background:#f2f6f3;color:#60716d;font-size:12px}.file-name{font-weight:700}.file-name a{color:#285b60}.folder-icon,.file-icon{display:inline-block;width:34px;margin-right:8px;color:#a47735;font-size:9px;font-weight:900}.file-icon{color:#51817c}.danger-button{padding:7px 11px;border:1px solid #c76c61;border-radius:2px;background:#fff5f3;color:#a43f35;font:inherit;font-size:12px;cursor:pointer}.empty-state{text-align:center;color:#71807e;padding:36px!important}@media(max-width:720px){.file-actions form{width:100%}.file-actions input[type=file],.mkdir-form input{flex:1;min-width:0}}
 `;
