@@ -3,6 +3,8 @@ interface Env {
   WEBDAV_KV: KVNamespace;
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
+  WEBDAV_USERNAME?: string;
+  WEBDAV_PASSWORD?: string;
   DAV_PREFIX?: string;
   // 新增：启用访问日志
   ENABLE_ACCESS_LOG?: string;
@@ -32,6 +34,7 @@ const METHODS = ["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL",
 const META_PREFIX = "meta:";
 const DIR_PREFIX = "dir:";
 const CREDENTIALS_KEY = "config:credentials";
+const ADMIN_CREDENTIALS_KEY = "config:admin-credentials";
 const SERVICE_CONFIG_KEY = "config:service";
 const SESSION_PREFIX = "session:";
 const LOG_PREFIX = "log:";
@@ -58,7 +61,7 @@ export default {
     let username = "anonymous";
     if (await authenticate(request, env)) {
       authenticated = true;
-      const credentials = await getCredentials(env);
+      const credentials = await getWebdavCredentials(env);
       username = credentials.username;
     } else {
       return new Response("Unauthorized", {
@@ -134,7 +137,7 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
 }
 
 async function authenticate(request: Request, env: Env): Promise<boolean> {
-  const credentials = await getCredentials(env);
+  const credentials = await getWebdavCredentials(env);
   const header = request.headers.get("Authorization");
   if (!header?.startsWith("Basic ")) return false;
   try {
@@ -159,8 +162,18 @@ interface ServiceConfig {
   password: string;
 }
 
-async function getCredentials(env: Env): Promise<Credentials> {
+async function getWebdavCredentials(env: Env): Promise<Credentials> {
   const saved = await env.WEBDAV_KV.get(CREDENTIALS_KEY, "json") as Credentials | null;
+  if (saved?.username && saved.passwordHash && saved.salt) return saved;
+  return {
+    username: env.WEBDAV_USERNAME || DEFAULT_USERNAME,
+    passwordHash: await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
+    salt: "default-salt",
+  };
+}
+
+async function getAdminCredentials(env: Env): Promise<Credentials> {
+  const saved = await env.WEBDAV_KV.get(ADMIN_CREDENTIALS_KEY, "json") as Credentials | null;
   if (saved?.username && saved.passwordHash && saved.salt) return saved;
   return {
     username: env.ADMIN_USERNAME || DEFAULT_USERNAME,
@@ -173,8 +186,8 @@ async function getServiceConfig(request: Request, env: Env): Promise<ServiceConf
   const saved = await env.WEBDAV_KV.get(SERVICE_CONFIG_KEY, "json") as Partial<ServiceConfig> | null;
   return {
     url: saved?.url || new URL(request.url).origin,
-    username: saved?.username || env.ADMIN_USERNAME || DEFAULT_USERNAME,
-    password: saved?.password || env.ADMIN_PASSWORD || DEFAULT_PASSWORD,
+    username: saved?.username || env.WEBDAV_USERNAME || DEFAULT_USERNAME,
+    password: saved?.password || env.WEBDAV_PASSWORD || DEFAULT_PASSWORD,
   };
 }
 
@@ -203,7 +216,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
-    const credentials = await getCredentials(env);
+    const credentials = await getAdminCredentials(env);
     const username = String(form.get("username") ?? "");
     const password = String(form.get("password") ?? "");
     if (username !== credentials.username || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) return adminLoginPage("用户名或密码错误");
@@ -227,11 +240,18 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!/^[A-Za-z0-9._-]{2,64}$/.test(service.username)) return await adminPage(request, env, "WebDAV 账户须为 2-64 位字母、数字、点、下划线或短横线");
       if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
       await env.WEBDAV_KV.put(SERVICE_CONFIG_KEY, JSON.stringify(service));
-      const current = await getCredentials(env);
       const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
       await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username: service.username, salt, passwordHash: await hashPassword(service.password, salt) }));
-      if (current.username !== service.username) return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
       return await adminPage(request, env, "服务连接信息已保存");
+    }
+    if (action === "save-admin") {
+      const username = String(form.get("adminUsername") || "").trim();
+      const password = String(form.get("adminPassword") || "");
+      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return await adminPage(request, env, "管理员账户须为 2-64 位字母、数字、点、下划线或短横线");
+      if (password.length < 8) return await adminPage(request, env, "管理员密码至少需要 8 位");
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      await env.WEBDAV_KV.put(ADMIN_CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
+      return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
     if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) return adminFilesAction(request, env, form);
     if (view === "trash" && ["restore", "empty"].includes(action)) {
@@ -244,11 +264,11 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const form = await request.formData();
     const username = String(form.get("username") ?? "").trim();
     const password = String(form.get("password") ?? "");
-    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return adminPage(request, env, "用户名须为 2-64 位字母、数字、点、下划线或短横线");
-    if (password.length < 8) return adminPage(request, env, "密码至少需要 8 位");
+    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return adminPage(request, env, "管理员账户须为 2-64 位字母、数字、点、下划线或短横线");
+    if (password.length < 8) return adminPage(request, env, "管理员密码至少需要 8 位");
     const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-    await env.WEBDAV_KV.put(CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
-    return adminPage(request, env, "账号已更新，新的 WebDAV 凭证已生效");
+    await env.WEBDAV_KV.put(ADMIN_CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
+    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
   }
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
@@ -329,7 +349,11 @@ async function adminPage(request: Request, env: Env, message = ""): Promise<Resp
 const ADMIN_CSS = `:root{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17212b;background:#eef2f1}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%)}a{color:inherit;text-decoration:none}.topbar{background:#183b3f;color:#f4f8f5}.topbar-inner{max-width:1120px;margin:auto;padding:18px 28px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.01em}.brand-mark{display:grid;place-items:center;width:42px;height:42px;background:#e8b35a;color:#183b3f;font-size:13px;font-weight:900;letter-spacing:-.06em}.brand-mark.small{width:30px;height:30px;font-size:10px}.status-dot{font-size:13px;color:#c4e3cf}.status-dot:before{content:"";display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:#6bc58d}.dashboard{max-width:1120px;margin:0 auto;padding:54px 28px 72px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:32px}.eyebrow{margin:0 0 9px;color:#8a6940;font-size:11px;font-weight:800;letter-spacing:.16em}.page-heading h1{margin:0;font-size:clamp(30px,5vw,48px);letter-spacing:-.04em}.muted{color:#667578;line-height:1.6}.text-link{color:#32656a;font-size:14px;font-weight:700}.summary-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}.summary-card,.config-card{background:rgba(255,255,255,.82);border:1px solid #d7e0dc;box-shadow:0 12px 30px rgba(31,61,57,.06)}.summary-card{min-height:132px;padding:22px}.summary-card.accent{border-top:3px solid #d79b41}.card-label{display:block;margin-bottom:20px;color:#71807e;font-size:12px;font-weight:700}.summary-card strong{display:block;font-size:22px;letter-spacing:-.02em}.card-meta{display:block;margin-top:8px;color:#84918f;font-size:13px}.content-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.config-card{padding:28px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:8px}.card-heading h2{margin:0;font-size:22px;letter-spacing:-.03em}.icon-badge{display:grid;place-items:center;width:32px;height:32px;background:#eef3ee;color:#8a6940;font-size:11px;font-weight:800}.config-form{margin-top:25px}.config-form label{display:block;margin:17px 0 6px;font-size:13px;font-weight:700}.config-form input{display:block;width:100%;margin-top:7px;padding:13px 14px;border:1px solid #cbd7d3;border-radius:2px;background:#fbfcfa;color:#17212b;font:inherit;outline:none}.config-form input:focus{border-color:#4c8581;box-shadow:0 0 0 3px rgba(76,133,129,.14)}.primary-button{margin-top:20px;padding:12px 18px;border:0;border-radius:2px;background:#d79b41;color:#183b3f;font:inherit;font-weight:800;cursor:pointer}.primary-button:hover{background:#e5ae59}.tool-list{margin-top:17px;border-top:1px solid #e0e7e3}.tool-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 0;border-bottom:1px solid #e0e7e3}.tool-row strong,.tool-row small{display:block}.tool-row small{margin-top:5px;color:#71807e;font-size:13px}.arrow{color:#397277;font-size:22px}.info-strip{display:flex;align-items:center;gap:11px;margin-top:22px;padding:16px 19px;background:#e7f0eb;color:#45625d;font-size:13px;line-height:1.5}.info-icon{display:grid;place-items:center;flex:none;width:20px;height:20px;border:1px solid #70968b;border-radius:50%;font-size:12px}.notice{margin:-12px 0 22px;padding:13px 16px;background:#e7f4eb;border-left:3px solid #3d9368}.success{color:#176b48}.error{margin:18px 0;padding:11px 13px;background:#fff0ee;color:#a43f35}.login-shell{display:grid;place-items:center;min-height:100vh;padding:24px}.login-panel{width:min(100%,420px);padding:42px;background:rgba(255,255,255,.9);border:1px solid #d7e0dc;box-shadow:0 18px 50px rgba(31,61,57,.12)}.login-panel h1{margin:0;font-size:32px;letter-spacing:-.04em}.login-panel .muted{margin:10px 0 28px}.login-panel label{display:block;margin:17px 0 6px;font-size:13px;font-weight:700}.login-panel input{display:block;width:100%;margin-top:7px;padding:13px 14px;border:1px solid #cbd7d3;border-radius:2px;background:#fbfcfa;color:#17212b;font:inherit}.login-panel .primary-button{width:100%;margin-top:25px}@media(max-width:720px){.topbar-inner,.dashboard{padding-left:20px;padding-right:20px}.dashboard{padding-top:36px}.page-heading{align-items:flex-start;flex-direction:column}.summary-grid,.content-grid{grid-template-columns:1fr}.config-card{padding:22px}}`;
 
 function htmlResponse(body: string): Response {
-  return new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+  const adminForm = body.includes("<title>WebDAV 控制台</title>")
+    ? `<section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">ADMIN ACCOUNT</p><h2>管理员账号</h2></div><span class="icon-badge">03</span></div><p class="muted">管理员账号只用于登录此管理界面，不用于 WebDAV 客户端。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="save-admin"><label>管理员账户<input name="adminUsername" autocomplete="username" placeholder="例如：admin" required></label><label>管理员密码<input name="adminPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><button class="primary-button" type="submit">保存管理员账号</button></form></section>`
+    : "";
+  const renderedBody = adminForm ? body.replace("</main></body>", `${adminForm}</main></body>`) : body;
+  return new Response(renderedBody, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 function requestPath(request: Request, env: Env): string {

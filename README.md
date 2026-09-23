@@ -6,7 +6,7 @@
 
 支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY` 和 `MOVE`。
 
-默认首次登录账号为 `admin` / `admin123456`，访问 Worker 域名根路径即可进入管理界面；登录后可修改 WebDAV 连接信息，更新后的凭证哈希保存在 KV 中。
+默认管理员账号和 WebDAV 账号均为 `admin` / `admin123456`，但两者相互独立。访问 Worker 域名根路径即可进入管理界面；登录后可分别修改管理员账号和 WebDAV 连接信息。
 
 新增能力：
 - 访问日志：记录请求方法、路径、状态码、客户端 IP 等，可在后台查看
@@ -64,6 +64,8 @@
 | --- | --- |
 | `ADMIN_USERNAME` | 自定义用户名 |
 | `ADMIN_PASSWORD` | 自定义密码 |
+
+`ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 仅用于登录管理界面，不会改变 WebDAV 客户端账号。WebDAV 账号在管理界面中单独配置；如需通过环境变量预设，可使用 `WEBDAV_USERNAME` 和 `WEBDAV_PASSWORD`。
 
 #### 第 4 步：发布代码
 
@@ -123,7 +125,7 @@ https://你的-worker.workers.dev/
 密码：admin123456
 ```
 
-登录后可在管理界面修改 WebDAV 服务链接、账户和密码，浏览器上传/删除文件，查看访问日志和恢复回收站文件。WebDAV 客户端使用管理界面中显示的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
+登录后可在管理界面分别修改管理员账户和 WebDAV 服务链接、账户、密码，浏览器上传/删除文件，查看访问日志和恢复回收站文件。WebDAV 客户端使用 WebDAV 配置中的服务链接、账户和密码。也可以执行下面的请求确认 WebDAV 已生效：
 
 ```bash
 curl -i -u admin:admin123456 -X OPTIONS https://你的-worker.workers.dev/
@@ -226,16 +228,19 @@ curl -i -u admin:admin123456 -X PROPFIND -H 'Depth: 1' https://你的-worker.wor
 | --- | --- | --- |
 | `WEBDAV_BUCKET` | R2 binding | 文件内容存储位置 |
 | `WEBDAV_KV` | KV binding | 目录标记、元数据、凭证和会话缓存 |
+| `WEBDAV_USERNAME` | Secret/var | 可选，预设 WebDAV 客户端账户 |
+| `WEBDAV_PASSWORD` | Secret | 可选，预设 WebDAV 客户端密码 |
 | `ADMIN_USERNAME` | Secret | 可选，覆盖默认用户名 |
 | `ADMIN_PASSWORD` | Secret | 可选，覆盖默认密码 |
 | `DAV_PREFIX` | var | 可选前缀，如 `team-files` |
 | `ENABLE_ACCESS_LOG` | var | 是否启用访问日志，默认 `true` |
 
-如果未显式设置管理员账号，代码会使用默认 `admin` / `admin123456` 作为首次引导值；一旦用户在后台修改密码，KV 配置会覆盖环境变量。
+如果未显式设置管理员账号或 WebDAV 账号，代码分别使用默认 `admin` / `admin123456` 作为首次引导值。管理界面中保存的两套凭证会分别写入 KV，互不覆盖。
 
 ## 管理后台功能
 
 访问 Worker 域名根路径后，可使用：
+- 管理员配置：修改管理界面的账户和密码
 - 连接配置：修改 WebDAV 服务链接、账户和密码
 - 文件管理：浏览、上传、新建目录和删除文件
 - 访问日志：查看请求记录
