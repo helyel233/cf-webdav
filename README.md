@@ -281,7 +281,7 @@ curl -i -u admin:change-this-local-password http://localhost:8787/docs/hello.txt
 
 - `R2` 保存文件字节内容，`KV` 保存可重建的元数据和目录状态
 - 读取文件时优先以 R2 为准；KV 异常或延迟不会破坏文件内容
-- `Depth: infinity` 会被拒绝，推荐客户端使用 `Depth: 1`
+- 支持 `Depth: 0`、`Depth: 1` 和 `Depth: infinity`，兼容需要递归读取目录的客户端
 - 当前实现是单管理员 Basic Auth，适合个人或小规模网盘使用
 
 ## 注意事项

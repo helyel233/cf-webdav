@@ -958,24 +958,25 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
 }
 
 async function propfind(request: Request, env: Env, path: string, account?: WebdavAccount): Promise<Response> {
-  const depth = request.headers.get("Depth") ?? "infinity";
-  if (depth === "infinity") return textResponse("Depth infinity is not supported", 403);
+  const depth = (request.headers.get("Depth") ?? "infinity").trim().toLowerCase();
+  if (depth !== "0" && depth !== "1" && depth !== "infinity") return textResponse("Invalid Depth header", 400);
   const rootObject = path ? await env.WEBDAV_BUCKET.head(r2Key(path)) : null;
   const rootIsDirectory = !rootObject;
   if (path && !rootObject && !(await env.WEBDAV_KV.get(dirKey(path))) && !(await hasChildren(env, path))) return textResponse("Not Found", 404);
   const entries = [{ path, directory: rootIsDirectory }];
-  if (depth !== "0" && rootIsDirectory) entries.push(...await listChildren(env, path));
+  if (depth === "1" && rootIsDirectory) entries.push(...await listChildren(env, path));
+  if (depth === "infinity" && rootIsDirectory) entries.push(...await listDescendants(env, path));
   const xml = entries.map((entry) => propResponse(request, env, entry.path, entry.directory, account)).join("");
-  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "application/xml; charset=utf-8" } });
+  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1", "Cache-Control": "no-store" } });
 }
 
 async function propResponse(request: Request, env: Env, path: string, directory: boolean, account?: WebdavAccount): Promise<string> {
   const object = directory ? null : await env.WEBDAV_BUCKET.head(r2Key(path));
-  const accountPath = account ? `/${encodeURIComponent(account.owner)}/${account.uuid}` : "";
-  const href = `${new URL(request.url).origin}${accountPath}${urlPath(env, path)}${directory ? "/" : ""}`;
+  const displayName = path ? path.slice(path.lastIndexOf("/") + 1) : "WebDAV";
+  const href = `${new URL(request.url).origin}${urlPath(env, path)}${directory ? "/" : ""}`;
   const size = object?.size ?? 0;
   const modified = object?.uploaded?.toUTCString() ?? new Date().toUTCString();
-  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
 }
 
 function urlPath(env: Env, path: string): string {
@@ -995,6 +996,17 @@ async function listChildren(env: Env, path: string): Promise<Array<{ path: strin
   }
   return [...new Map(result.map((entry) => [entry.path, entry])).values()];
 }
+
+async function listDescendants(env: Env, path: string): Promise<Array<{ path: string; directory: boolean }>> {
+  const descendants: Array<{ path: string; directory: boolean }> = [];
+  const children = await listChildren(env, path);
+  for (const child of children) {
+    descendants.push(child);
+    if (child.directory) descendants.push(...await listDescendants(env, child.path));
+  }
+  return descendants;
+}
+
 async function hasChildren(env: Env, path: string): Promise<boolean> {
   return (await listChildren(env, path)).length > 0;
 }
