@@ -22,7 +22,40 @@
 
 ## 一键部署流程
 
-### 方式 A：本地自动创建资源并部署（推荐）
+### 方式 A：控制台手动创建并绑定（最适合小白，推荐优先）
+
+这是最容易上手的方案，适合没有本地 Node 环境、或不想先碰 Wrangler 的用户。
+
+1. 登录 Cloudflare Dashboard
+2. 进入 **Workers & Pages -> Create application**
+3. 选择创建一个 Worker
+4. 在 **Settings -> Variables and Bindings** 中点击 **Add binding**
+5. 添加以下绑定：
+   - `WEBDAV_BUCKET`：选择或新建 R2 Bucket
+   - `WEBDAV_KV`：选择或新建 KV Namespace
+   - `DAV_PREFIX`：可选，默认留空
+   - `ENABLE_ACCESS_LOG`：可选，默认设为 `true`
+6. 如需设置管理员账号，可在 **Secrets** 中添加：
+   - `ADMIN_USERNAME`
+   - `ADMIN_PASSWORD`
+7. 保存并点击部署
+
+如果你在 Cloudflare 控制台里创建 Worker，默认可以直接填写以下命令：
+
+```bash
+# 构建命令（Build command）
+# 留空即可，或者填写：
+npm run typecheck
+
+# 部署命令（Deploy command）
+npm run deploy
+```
+
+> 说明：在 Cloudflare 的 GitHub 连接部署页面中，`Build command` 可以直接填 `npm run typecheck`，`Deploy command` 固定填 `npm run deploy`。这样最简单，也最容易排查问题。
+
+### 方式 B：本地自动创建资源并部署
+
+适合已经有本地 Node 环境，而且希望自动创建 KV/R2 的用户。
 
 ```bash
 npm install
@@ -41,20 +74,6 @@ npm run deploy:setup
 ```bash
 WEBDAV_KV_TITLE=my-kv-name WEBDAV_R2_BUCKET=my-bucket-name npm run deploy:setup
 ```
-
-### 方式 B：控制台手动创建并绑定
-
-1. 在 Cloudflare Dashboard 中打开 **Workers & Pages -> Create application**
-2. 选择创建 Worker
-3. 在 **Settings -> Variables and Bindings** 中添加：
-   - `WEBDAV_BUCKET`：R2 Bucket
-   - `WEBDAV_KV`：KV Namespace
-   - `DAV_PREFIX`：可选，默认空字符串
-   - `ENABLE_ACCESS_LOG`：可选，默认 `true`
-4. 如需覆盖默认管理员账号，可在 **Secrets** 中设置：
-   - `ADMIN_USERNAME`
-   - `ADMIN_PASSWORD`
-5. 保存并部署
 
 ### 方式 C：仅手动部署
 
