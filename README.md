@@ -69,7 +69,23 @@
 
 ##### 选项 1：Dashboard 直接发布
 
-如果不想修改 [wrangler.toml](wrangler.toml)，使用 Worker 的 Dashboard 代码编辑器，将项目代码提供给当前 Worker，然后点击 **Deploy**。这种方式的 KV/R2 绑定由 Dashboard 保存，不读取仓库中的 KV 占位 ID。
+如果不想修改 [wrangler.toml](wrangler.toml)，可以直接在 Worker 的 Dashboard 代码编辑器中发布。具体操作如下：
+
+1. 打开 Worker，进入 **Edit code** 或 **Quick edit**。
+2. 如果页面要求选择脚本类型，选择 **Module Worker**；不要选择 Service Worker 格式。
+3. 打开项目中的 [src/index.ts](src/index.ts)，复制文件的全部内容。
+4. 将复制的内容完整粘贴到 Dashboard 的代码编辑器中，替换编辑器里的示例代码。
+5. 点击 **Save and deploy** 或 **Deploy**。
+
+本项目的运行时代码只有 [src/index.ts](src/index.ts) 一个入口文件，没有需要另外粘贴的源码模块。以下文件不需要粘贴到代码编辑器：
+
+- [wrangler.toml](wrangler.toml)：本地 Wrangler 和 GitHub 部署配置，不是 Worker 运行时代码。
+- `package.json`：本地依赖和命令配置。
+- `worker-configuration.d.ts`：TypeScript 类型声明，不是运行时代码。
+
+如果 Dashboard 编辑器明确只接受 JavaScript，不能直接粘贴 TypeScript 文件；需要先把 [src/index.ts](src/index.ts) 编译为 JavaScript，再粘贴编译后的完整脚本。不要只复制 `export default` 部分，否则同文件中的认证、WebDAV、日志和回收站函数会缺失。
+
+粘贴代码后，确认第 3 步中的 `WEBDAV_BUCKET` 和 `WEBDAV_KV` 绑定已经保存，再点击 **Deploy**。这种方式的 KV/R2 绑定由 Dashboard 保存，不读取仓库中的 KV 占位 ID。
 
 发布完成后，打开 `https://你的-worker.workers.dev/__admin`，使用默认账号 `admin / admin123456` 登录。首次登录后请立即修改密码。
 
