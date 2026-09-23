@@ -981,7 +981,7 @@ async function propfind(request: Request, env: Env, path: string, account?: Webd
   const entries = [{ path, directory: rootIsDirectory }];
   if (depth === "1" && rootIsDirectory) entries.push(...await listChildren(env, path));
   if (depth === "infinity" && rootIsDirectory) entries.push(...await listDescendants(env, path));
-  const xml = entries.map((entry) => propResponse(request, env, entry.path, entry.directory, account)).join("");
+  const xml = (await Promise.all(entries.map((entry) => propResponse(request, env, entry.path, entry.directory, account)))).join("");
   return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1", "Cache-Control": "no-store" } });
 }
 
