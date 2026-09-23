@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node scripts/validate-deploy-config.mjs && wrangler deploy",
     "setup:resources": "node scripts/setup-resources.mjs",
     "deploy:setup": "npm run setup:resources && npm run deploy",
     "typecheck": "wrangler types && tsc --noEmit",

@@ -43,7 +43,7 @@
 7. 保存绑定配置后，点击 **Deploy**，等待发布完成
 8. 打开 `https://你的-worker.workers.dev/__admin`，首次登录使用 `admin / admin123456`
 
-> 重要：如果你已经在 Cloudflare Dashboard 中手动绑定了 KV/R2，那么不要再本地执行 `npm run deploy`，除非你已经把 [wrangler.toml](wrangler.toml) 里的 `id` 改成真实的 KV Namespace ID。否则 `replace-during-setup` 这种占位值会被当成真实 ID 发送给 Cloudflare API，导致部署失败。
+> 重要：如果你使用 GitHub 连接部署，Cloudflare 仍会执行 `wrangler deploy` 并读取 [wrangler.toml](wrangler.toml)。即使你已经在 Dashboard 中手动绑定了 KV/R2，也必须先把其中的 `id` 改成真实的 KV Namespace ID；`replace-during-setup` 不能用于部署。
 
 如果你使用 **GitHub 连接部署**，可以在构建设置中填写以下默认命令：
 
@@ -56,7 +56,7 @@ npm run typecheck
 npm run deploy
 ```
 
-> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。这组命令只适合 GitHub 连接部署流程；如果你已经在 Cloudflare Dashboard 中手动绑定了 KV/R2，也不要带着 [wrangler.toml](wrangler.toml) 里的占位 `replace-during-setup` 去本地执行 `npm run deploy`，否则会把无效的占位 KV ID 传给 Cloudflare API，导致部署失败。
+> 说明：手动在 Dashboard 创建并绑定 Worker 时，不需要填写或执行这两条命令，直接点击 **Deploy** 即可。这组命令只适合 GitHub 连接部署流程，并且要求 [wrangler.toml](wrangler.toml) 中已经写入真实的 KV Namespace ID。
 
 > 正确做法：
 > - 方式 A：使用控制台按钮部署，或者让 GitHub 自动部署
