@@ -521,7 +521,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
-    return view === "logs" ? adminLogsPage(env, sessionUser_) : adminPage(request, env);
+    const ownedNames = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === sessionUser_).map((account) => account.username);
+    return view === "logs" ? adminLogsPage(env, [sessionUser_, ...ownedNames]) : adminPage(request, env);
   }
   // 新增：校验新建 WebDAV 账户的 UUID 是否重复
   if (url.searchParams.get("api") === "check-uuid" && request.method === "GET") {
@@ -536,7 +537,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   const selectedAccount = (await getWebdavAccounts(env))[requestedAccount || ""];
   if (selectedAccount && selectedAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
   if (view === "account") return selectedAccount ? adminAccountPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
-  if (view === "logs") return adminLogsPage(env, sessionUser_);
+  if (view === "logs") return adminLogsPage(env, [sessionUser_, ...ownedAccountList.map((account) => account.username)]);
   if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "accounts") return adminPage(request, env);
@@ -1563,11 +1564,11 @@ async function checkRateLimit(env: Env, clientIp: string, method: string, conten
 }
 
 // 新增：访问日志页面
-async function adminLogsPage(env: Env, filterUser = ""): Promise<Response> {
+async function adminLogsPage(env: Env, filterUsers: string[] = []): Promise<Response> {
   const logs: AccessLog[] = [];
   let cursor: string | undefined;
   // 日志键为倒序时间戳，list 升序即最新在前：全量视图只需首页，按用户过滤时最多读取 10 页
-  let pagesLeft = filterUser ? 10 : 1;
+  let pagesLeft = filterUsers.length ? 10 : 1;
   do {
     const page = await env.WEBDAV_KV.list({ prefix: LOG_PREFIX, cursor, limit: 100 });
     const pageLogs = await Promise.all(page.keys.map(async (key) => await env.WEBDAV_KV.get(key.name, "json") as AccessLog | null));
@@ -1577,8 +1578,8 @@ async function adminLogsPage(env: Env, filterUser = ""): Promise<Response> {
   } while (cursor && pagesLeft > 0);
 
   logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  // 普通用户视图仅展示自己的操作日志；超级管理员/管理入口展示全部
-  const visibleLogs = filterUser ? logs.filter((log) => log.user === filterUser) : logs;
+  // 普通用户视图展示自己及名下 WebDAV 账户的操作日志（WebDAV 客户端操作的 user 为账户名）；超级管理员/管理入口展示全部
+  const visibleLogs = filterUsers.length ? logs.filter((log) => filterUsers.includes(log.user)) : logs;
   const recentLogs = visibleLogs.slice(0, 100);
 
   const logRows = recentLogs.map(log => {
