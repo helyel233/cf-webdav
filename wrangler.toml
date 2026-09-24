@@ -22,3 +22,5 @@ bucket_name = "cf-webdav-files-helyel2332"
 DAV_PREFIX = ""
 # true 时启用访问日志，可在后台查看
 ENABLE_ACCESS_LOG = "true"
+# 设为 "false" 可关闭公开注册，仅超级管理员可在后台创建用户（默认开启）
+# ENABLE_PUBLIC_REGISTRATION = "false"

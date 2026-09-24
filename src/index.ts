@@ -8,6 +8,7 @@ interface Env {
   DAV_PREFIX?: string;
   // 新增：启用访问日志
   ENABLE_ACCESS_LOG?: string;
+  ENABLE_PUBLIC_REGISTRATION?: string;
 }
 interface FileMeta {
   type: "file";
@@ -193,22 +194,24 @@ async function getAdminAccounts(env: Env): Promise<Record<string, AdminAccount>>
         changed = true;
       }
     }
+    // env 注入的管理员仅在账户不存在时一次性引导：每请求无条件覆盖会回滚界面改密，并触发 KV 同键写冲突
     const bootstrapUsername = env.ADMIN_USERNAME?.trim();
-    if (bootstrapUsername) {
+    if (bootstrapUsername && !saved[bootstrapUsername]) {
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
       saved[bootstrapUsername] = {
-        ...(saved[bootstrapUsername] || { username: bootstrapUsername }),
         username: bootstrapUsername,
-        passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
-        salt: "default-salt",
+        passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, salt),
+        salt,
         role: "admin",
       };
       changed = true;
     }
     if (!Object.values(saved).some((account) => account.role === "admin")) {
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
       saved[DEFAULT_USERNAME] = {
         username: DEFAULT_USERNAME,
-        passwordHash: await hashPassword(DEFAULT_PASSWORD, "default-salt"),
-        salt: "default-salt",
+        passwordHash: await hashPassword(DEFAULT_PASSWORD, salt),
+        salt,
         role: "admin",
       };
       changed = true;
@@ -217,11 +220,12 @@ async function getAdminAccounts(env: Env): Promise<Record<string, AdminAccount>>
     return saved;
   }
   const legacy = await env.WEBDAV_KV.get(ADMIN_CREDENTIALS_KEY, "json") as AdminAccount | null;
+  const defaultSalt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
   const accounts: Record<string, AdminAccount> = {
     [DEFAULT_USERNAME]: {
       username: DEFAULT_USERNAME,
-      passwordHash: await hashPassword(DEFAULT_PASSWORD, "default-salt"),
-      salt: "default-salt",
+      passwordHash: await hashPassword(DEFAULT_PASSWORD, defaultSalt),
+      salt: defaultSalt,
       role: "admin",
     },
   };
@@ -230,10 +234,11 @@ async function getAdminAccounts(env: Env): Promise<Record<string, AdminAccount>>
   }
   const bootstrapUsername = env.ADMIN_USERNAME?.trim();
   if (bootstrapUsername && !accounts[bootstrapUsername]) {
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
     accounts[bootstrapUsername] = {
       username: bootstrapUsername,
-      passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, "default-salt"),
-      salt: "default-salt",
+      passwordHash: await hashPassword(env.ADMIN_PASSWORD || DEFAULT_PASSWORD, salt),
+      salt,
       role: "admin",
     };
   }
@@ -259,7 +264,9 @@ async function getWebdavAccounts(env: Env): Promise<Record<string, WebdavAccount
   const legacy = await env.WEBDAV_KV.get(CREDENTIALS_KEY, "json") as Credentials | null;
   const username = legacy?.username || env.WEBDAV_USERNAME || DEFAULT_USERNAME;
   const admin = await getAdminCredentials(env);
-  const account = { username, owner: admin.username, url: new URL("https://example.invalid").origin, uuid: createAccountUuid(), passwordHash: legacy?.passwordHash || await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, "default-salt"), salt: legacy?.salt || "default-salt" };
+  const account = { username, owner: admin.username, url: new URL("https://example.invalid").origin, uuid: createAccountUuid(), passwordHash: legacy?.passwordHash || await hashPassword(env.WEBDAV_PASSWORD || DEFAULT_PASSWORD, legacy?.salt || "default-salt"), salt: legacy?.salt || "default-salt" };
+  // 必须持久化：否则 uuid 每次请求随机变化，且每请求重复执行 PBKDF2
+  await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify({ [username]: account }));
   return { [username]: account };
 }
 
@@ -276,6 +283,54 @@ function createAccountUuid(used = new Set<string>()): string {
   let uuid = "";
   do uuid = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1_000_000).padStart(6, "0"); while (used.has(uuid));
   return uuid;
+}
+
+// 用户名校验：字母数字开头结尾，允许内嵌点/下划线/短横线，禁止连续点与首尾点（用户名会进入存储前缀）
+function isValidUsername(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}[A-Za-z0-9_-]$/.test(name) && !name.includes("..");
+}
+
+// 账户表是 KV 单键 JSON 快照，读-改-写无原生原子性：写回前重读比对快照，检测到并发修改则整体重试（最多 3 次）
+async function mutateAccountTable<T>(
+  env: Env,
+  key: string,
+  bootstrap: () => Promise<Record<string, T>>,
+  transaction: (accounts: Record<string, T>) => Promise<string | null>,
+): Promise<string | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = await env.WEBDAV_KV.get(key);
+    const accounts = raw ? JSON.parse(raw) as Record<string, T> : await bootstrap();
+    const error = await transaction(accounts);
+    if (error) return error;
+    if (await env.WEBDAV_KV.get(key) !== raw) continue;
+    await env.WEBDAV_KV.put(key, JSON.stringify(accounts));
+    return null;
+  }
+  return "操作繁忙，请稍后重试";
+}
+
+// 后台登录/注册防爆破：按维度计数，窗口期内达到上限即拒绝
+async function checkAuthAttempts(env: Env, dimension: string, limit: number, windowSeconds: number): Promise<boolean> {
+  const now = Date.now();
+  const kvKey = `authlimit:${dimension}:${Math.floor(now / (windowSeconds * 1000))}`;
+  const count = parseInt(await env.WEBDAV_KV.get(kvKey) || "0");
+  if (count >= limit) return false;
+  await env.WEBDAV_KV.put(kvKey, String(count + 1), { expirationTtl: windowSeconds });
+  return true;
+}
+
+function sessionToken(request: Request): string | null {
+  return request.headers.get("Cookie")?.match(/(?:^|; )cf_webdav_session=([^;]+)/)?.[1] || null;
+}
+
+// 吊销指定用户的全部会话（session 键的值为用户名）
+async function revokeUserSessions(env: Env, username: string): Promise<void> {
+  const sessions = await env.WEBDAV_KV.list({ prefix: SESSION_PREFIX });
+  const doomed: Promise<void>[] = [];
+  for (const key of sessions.keys) {
+    if (await env.WEBDAV_KV.get(key.name) === username) doomed.push(env.WEBDAV_KV.delete(key.name));
+  }
+  await Promise.all(doomed);
 }
 
 function webdavAccountUrl(request: Request, account: WebdavAccount): string {
@@ -342,30 +397,43 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const isRoot = url.pathname === "/";
   if (isRoot && url.searchParams.get("action") === "logout") {
+    // 登出必须吊销服务端会话，仅清 cookie 会让泄露的 token 继续有效
+    const token = sessionToken(request);
+    if (token) await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
   }
   if (url.pathname === "/__admin/register") {
+    if (env.ENABLE_PUBLIC_REGISTRATION === "false") return adminLoginPage("注册已关闭，请联系管理员创建账户");
     if (request.method === "GET") return adminRegisterPage();
+    // 公开注册按 IP 限频，防止恶意占满账户名额
+    const registerIp = request.headers.get("CF-Connecting-IP") || "unknown";
+    if (!(await checkAuthAttempts(env, `register:${registerIp}`, 5, 3600))) return adminRegisterPage("注册尝试过于频繁，请一小时后再试");
     const form = await request.formData();
     const username = String(form.get("username") || "").trim();
     const password = String(form.get("password") || "");
     const confirmPassword = String(form.get("confirmPassword") || "");
-    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return adminRegisterPage("用户名格式不正确，密码至少需要 8 位");
+    if (!isValidUsername(username) || password.length < 8) return adminRegisterPage("用户名格式不正确，密码至少需要 8 位");
     if (password !== confirmPassword) return adminRegisterPage("两次输入的密码不一致");
-    const accounts = await getAdminAccounts(env);
-    if (accounts[username]) return adminRegisterPage("用户账户已存在");
-    if (Object.keys(accounts).length >= 10) return adminRegisterPage("账户最多创建 10 个");
-    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-    accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
-    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
-    return adminLoginPage("注册成功，请使用新账户登录");
+    const registerError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+      if (accounts[username]) return "用户账户已存在";
+      if (Object.keys(accounts).length >= 10) return "账户最多创建 10 个";
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
+      return null;
+    });
+    return registerError ? adminRegisterPage(registerError) : adminLoginPage("注册成功，请使用新账户登录");
   }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
     const username = String(form.get("username") ?? "");
     const password = String(form.get("password") ?? "");
     const credentials = (await getAdminAccounts(env))[username];
-    if (!credentials || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) return adminLoginPage("用户名或密码错误");
+    if (!credentials || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) {
+      // 登录失败按 IP+用户名限频，防止暴力破解
+      const loginIp = request.headers.get("CF-Connecting-IP") || "unknown";
+      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, 5, 900))) return adminLoginPage("尝试次数过多，请 15 分钟后再试");
+      return adminLoginPage("用户名或密码错误");
+    }
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, username, { expirationTtl: SESSION_TTL });
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
@@ -389,11 +457,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (newPassword.length < 8) return adminChangePasswordPage("", "新密码至少需要 8 位");
       if (newPassword !== confirmPassword) return adminChangePasswordPage("", "两次输入的新密码不一致");
       if (newPassword === currentPassword) return adminChangePasswordPage("", "新密码不能与当前密码相同");
-      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      const accountsForPassword = await getAdminAccounts(env);
-      accountsForPassword[sessionUser_] = { ...sessionAccount, username: sessionUser_, salt, passwordHash: await hashPassword(newPassword, salt) };
-      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accountsForPassword));
-      return adminChangePasswordPage("密码已更新，请牢记新密码");
+      const changeError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+        const account = accounts[sessionUser_];
+        if (!account) return "账户不存在";
+        const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+        accounts[sessionUser_] = { ...account, username: sessionUser_, salt, passwordHash: await hashPassword(newPassword, salt) };
+        return null;
+      });
+      if (changeError) return adminChangePasswordPage("", changeError);
+      // 改密后吊销该用户全部会话（含当前），要求用新密码重新登录
+      await revokeUserSessions(env, sessionUser_);
+      return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
   }
   if (request.method === "POST" && (isRoot || url.pathname === "/__admin")) {
@@ -405,62 +479,71 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     if (action === "save-user-password") {
       const password = String(form.get("userPassword") || "");
       if (password.length < 8) return await adminPage(request, env, "用户密码至少需要 8 位");
-      const account = (await getAdminAccounts(env))[adminUsername];
-      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify({ ...(await getAdminAccounts(env)), [adminUsername]: { ...account, salt, passwordHash: await hashPassword(password, salt), role: "user" } }));
-      return await adminPage(request, env, "密码已更新");
+      // 必须已存在：无条件 upsert 会让已删除账户凭旧会话复活
+      const saveError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+        const account = accounts[adminUsername];
+        if (!account) return "账户不存在";
+        const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+        accounts[adminUsername] = { ...account, salt, passwordHash: await hashPassword(password, salt), role: "user" };
+        return null;
+      });
+      return saveError ? await adminPage(request, env, saveError) : await adminPage(request, env, "密码已更新");
     }
     if (action === "create-admin" || action === "save-admin") return textResponse("普通用户无权执行管理员操作", 403);
     if (action === "create-webdav") {
       const username = String(form.get("serviceUsername") || "").trim();
       const password = String(form.get("servicePassword") || "");
       const uuid = String(form.get("accountUuid") || "").trim();
-      if (ownedAccounts.length >= 2) return await adminPage(request, env, "每个管理员最多只能拥有 2 个 WebDAV 账户");
-      if (webdavAccounts[username]) return await adminPage(request, env, "WebDAV 账户名已存在，请换一个");
-      if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return await adminPage(request, env, "WebDAV 账户格式不正确，密码至少需要 8 位");
+      if (password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
       if (!/^\d{6}$/.test(uuid)) return await adminPage(request, env, "UUID 必须是 6 位数字");
-      if (Object.values(webdavAccounts).some((account) => account.uuid === uuid)) return await adminPage(request, env, "UUID 已存在，请换一个");
-      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      const account = { username, owner: adminUsername, uuid, url: "", salt, passwordHash: await hashPassword(password, salt) };
-      account.url = webdavAccountUrl(request, account);
-      webdavAccounts[username] = account;
-      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-      return await adminPage(request, env, "WebDAV 账户已创建");
+      // 查重与写入同事务，消除并发下的重名/同 UUID TOCTOU
+      const createError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
+        if (Object.values(accounts).filter((account) => account.owner === adminUsername).length >= 2) return "每个管理员最多只能拥有 2 个 WebDAV 账户";
+        if (accounts[username]) return "WebDAV 账户名已存在，请换一个";
+        if (!isValidUsername(username)) return "WebDAV 账户名格式不正确";
+        if (Object.values(accounts).some((account) => account.uuid === uuid)) return "UUID 已存在，请换一个";
+        const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+        const account: WebdavAccount = { username, owner: adminUsername, uuid, url: "", salt, passwordHash: await hashPassword(password, salt) };
+        account.url = webdavAccountUrl(request, account);
+        accounts[username] = account;
+        return null;
+      });
+      return createError ? await adminPage(request, env, createError) : await adminPage(request, env, "WebDAV 账户已创建");
     }
     if (action === "delete-webdav") {
       const accountUsername = String(form.get("accountUsername") || "");
       const account = webdavAccounts[accountUsername];
       if (!account || account.owner !== adminUsername) return textResponse("无权删除该 WebDAV 账户", 403);
       await deleteWebdavAccountData(env, account);
-      delete webdavAccounts[accountUsername];
-      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-      return await adminPage(request, env, "WebDAV 账户及其全部文件已删除");
+      const deleteError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
+        delete accounts[accountUsername];
+        return null;
+      });
+      return deleteError ? await adminPage(request, env, deleteError) : await adminPage(request, env, "WebDAV 账户及其全部文件已删除");
     }
     if (action === "save-service") {
       const accountUsername = String(form.get("accountUsername") || ownedAccounts[0]?.username || "");
       const account = webdavAccounts[accountUsername];
       if (!account || account.owner !== adminUsername) return await adminPage(request, env, "无权修改该 WebDAV 账户");
+      // 账户名是存储前缀（storageScope）的组成部分，改名会导致名下全部数据不可达，因此禁止修改
       const service = {
-        url: String(form.get("url") || "").trim().replace(/\/+$/, ""),
-        username: String(form.get("serviceUsername") || "").trim(),
         password: String(form.get("servicePassword") || ""),
         uuid: String(form.get("accountUuid") || "").trim(),
       };
       if (!/^\d{6}$/.test(service.uuid)) return await adminPage(request, env, "UUID 必须是 6 位数字");
-      if (!/^[A-Za-z0-9._-]{2,64}$/.test(service.username)) return await adminPage(request, env, "WebDAV 账户须为 2-64 位字母、数字、点、下划线或短横线");
       if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
-      if (Object.values(webdavAccounts).some((item) => item.uuid === service.uuid && item.username !== accountUsername)) return await adminPage(request, env, "UUID 已存在，请换一个");
-      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-      if (service.username !== accountUsername && webdavAccounts[service.username]) return await adminPage(request, env, "WebDAV 账户名已存在，请换一个");
-      delete webdavAccounts[accountUsername];
-      account.username = service.username;
-      account.uuid = service.uuid;
-      account.salt = salt;
-      account.passwordHash = await hashPassword(service.password, salt);
-      account.url = webdavAccountUrl(request, account);
-      webdavAccounts[service.username] = account;
-      await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-      return await adminPage(request, env, "服务连接信息已保存");
+      const saveError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
+        if (Object.values(accounts).some((item) => item.uuid === service.uuid && item.username !== accountUsername)) return "UUID 已存在，请换一个";
+        const target = accounts[accountUsername];
+        if (!target) return "WebDAV 账户不存在";
+        const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+        target.uuid = service.uuid;
+        target.salt = salt;
+        target.passwordHash = await hashPassword(service.password, salt);
+        target.url = webdavAccountUrl(request, target);
+        return null;
+      });
+      return saveError ? await adminPage(request, env, saveError) : await adminPage(request, env, "服务连接信息已保存");
     }
     if (action === "save-admin") {
       const username = String(form.get("adminUsername") || "").trim();
@@ -508,16 +591,6 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
   }
-  if (url.pathname === "/__admin/account" && request.method === "POST") {
-    const form = await request.formData();
-    const username = String(form.get("username") ?? "").trim();
-    const password = String(form.get("password") ?? "");
-    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return adminPage(request, env, "管理员账户须为 2-64 位字母、数字、点、下划线或短横线");
-    if (password.length < 8) return adminPage(request, env, "管理员密码至少需要 8 位");
-    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-    await env.WEBDAV_KV.put(ADMIN_CREDENTIALS_KEY, JSON.stringify({ username, salt, passwordHash: await hashPassword(password, salt) }));
-    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
-  }
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
@@ -556,23 +629,32 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
   if (action === "save-admin-password") {
     const password = String(form.get("adminPassword") || "");
     if (password.length < 8) return superAdminPage(env, "管理员密码至少需要 8 位");
-    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-    accounts[currentAdmin.username] = { ...currentAdmin, salt, passwordHash: await hashPassword(password, salt), role: "admin" };
-    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
-    return superAdminPage(env, "管理员密码已更新");
+    const saveError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+      const account = accounts[currentAdmin.username];
+      if (!account) return "账户不存在";
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      accounts[currentAdmin.username] = { ...account, salt, passwordHash: await hashPassword(password, salt), role: "admin" };
+      return null;
+    });
+    if (saveError) return superAdminPage(env, saveError);
+    // 改密后吊销全部会话（含当前），要求用新密码重新登录
+    await revokeUserSessions(env, currentAdmin.username);
+    return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
   }
   if (action === "create-user") {
     const username = String(form.get("userUsername") || "").trim();
     const password = String(form.get("userPassword") || "");
     const confirmPassword = String(form.get("userPasswordConfirm") || "");
-    if (!/^[A-Za-z0-9._-]{2,64}$/.test(username) || password.length < 8) return superAdminPage(env, "用户账户格式不正确，密码至少需要 8 位");
+    if (!isValidUsername(username) || password.length < 8) return superAdminPage(env, "用户账户格式不正确，密码至少需要 8 位");
     if (password !== confirmPassword) return superAdminPage(env, "两次输入的密码不一致");
-    if (accounts[username]) return superAdminPage(env, "用户账户已存在");
-    if (Object.keys(accounts).length >= 10) return superAdminPage(env, "账户最多创建 10 个");
-    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-    accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
-    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
-    return superAdminPage(env, "用户账户已创建");
+    const createError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+      if (accounts[username]) return "用户账户已存在";
+      if (Object.keys(accounts).length >= 10) return "账户最多创建 10 个";
+      const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+      accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
+      return null;
+    });
+    return createError ? superAdminPage(env, createError) : superAdminPage(env, "用户账户已创建");
   }
   if (action === "create-webdav-admin") {
     return superAdminPage(env, "管理员无权为用户创建 WebDAV 账户");
@@ -581,11 +663,15 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
     const username = String(form.get("serviceUsername") || "");
     const webdavAccounts = await getWebdavAccounts(env);
     const account = webdavAccounts[username];
-    if (!account || !accounts[account.owner] || accounts[account.owner].role === "admin") return superAdminPage(env, "无权删除该 WebDAV 账户");
+    // owner 不存在时视为孤儿账户，允许超管清理；owner 为管理员时拒绝
+    const ownerRole = account ? accounts[account.owner]?.role : undefined;
+    if (!account || ownerRole === "admin") return superAdminPage(env, "无权删除该 WebDAV 账户");
     await deleteWebdavAccountData(env, account);
-    delete webdavAccounts[username];
-    await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-    return superAdminPage(env, "WebDAV 账户及其文件已删除");
+    const deleteError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
+      delete accounts[username];
+      return null;
+    });
+    return deleteError ? superAdminPage(env, deleteError) : superAdminPage(env, "WebDAV 账户及其文件已删除");
   }
   if (action === "delete-user") {
     const username = String(form.get("userUsername") || "");
@@ -598,9 +684,21 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
         delete webdavAccounts[account.username];
       }
     }
-    delete accounts[username];
-    await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-    await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(accounts));
+    // 两个账户表分键存储无法原子级联，先删 WebDAV 表再删用户表，失败侧可重试
+    const webdavError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
+      for (const account of Object.values(accounts)) {
+        if (account.owner === username) delete accounts[account.username];
+      }
+      return null;
+    });
+    if (webdavError) return superAdminPage(env, webdavError);
+    const userError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+      delete accounts[username];
+      return null;
+    });
+    if (userError) return superAdminPage(env, userError);
+    // 删除用户后吊销其全部会话，防止凭旧 cookie 继续操作
+    await revokeUserSessions(env, username);
     return superAdminPage(env, "用户及其 WebDAV 账户已删除");
   }
   return superAdminPage(env, "不支持的操作");
@@ -644,19 +742,19 @@ async function adminAccountPage(request: Request, env: Env, account: WebdavAccou
   const scopedEnv = createScopedEnv(env, storageScope(account));
   const fileCount = (await listAllObjects(scopedEnv, "")).filter((item) => !item.key.startsWith("__trash/")).length;
   const accountUrl = webdavAccountUrl(request, account);
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(account.username)} - WebDAV 管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账户管理", `<a class="text-link inverse" href="/">返回账户选择</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("WEBDAV ACCOUNT", account.username, `当前账户包含 ${fileCount} 个文件，仅显示此账户的数据。`)}<section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">CONNECTION</p><h2>账户连接信息</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">服务链接：${escapeHtml(accountUrl)}</p><form method="post" action="/?view=account&account=${encodeURIComponent(account.username)}" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" placeholder="输入新密码" required></label><label>6 位 UUID<input name="accountUuid" value="${escapeHtml(account.uuid || "")}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button class="primary-button" type="submit">保存账户信息</button></form><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></article></section></main></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(account.username)} - WebDAV 管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账户管理", `<a class="text-link inverse" href="/">返回账户选择</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("WEBDAV ACCOUNT", account.username, `当前账户包含 ${fileCount} 个文件，仅显示此账户的数据。`)}<section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">CONNECTION</p><h2>账户连接信息</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">服务链接：${escapeHtml(accountUrl)}</p><form method="post" action="/?view=account&account=${encodeURIComponent(account.username)}" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" autocomplete="username" readonly title="账户名是存储路径标识，不可修改"></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" placeholder="输入新密码" required></label><label>6 位 UUID<input name="accountUuid" value="${escapeHtml(account.uuid || "")}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button class="primary-button" type="submit">保存账户信息</button></form><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></article></section></main></body></html>`);
 }
 
 async function adminAccountsPage(request: Request, env: Env, adminUsername: string): Promise<Response> {
   const accounts = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === adminUsername);
-  const rows = accounts.map((account) => `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.username.slice(0, 2).toUpperCase())}</span></div><p class="muted">服务链接：${escapeHtml(account.url)}</p><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" required></label><label>密码<input name="servicePassword" type="password" minlength="8" placeholder="输入新密码" required></label><label>服务链接<input name="url" type="url" value="${escapeHtml(account.url)}" required></label><button class="primary-button" type="submit">保存 WebDAV 账户</button><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></form></article>`).join("");
+  const rows = accounts.map((account) => `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.username.slice(0, 2).toUpperCase())}</span></div><p class="muted">服务链接：${escapeHtml(account.url)}</p><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" readonly title="账户名是存储路径标识，不可修改"></label><label>密码<input name="servicePassword" type="password" minlength="8" placeholder="输入新密码" required></label><label>服务链接<input name="url" type="url" value="${escapeHtml(account.url)}" required></label><button class="primary-button" type="submit">保存 WebDAV 账户</button><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></form></article>`).join("");
   const createForm = accounts.length < 2 ? `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">NEW ACCOUNT</p><h2>创建 WebDAV 账户</h2></div><span class="icon-badge">+</span></div><p class="muted">每个管理员最多拥有 2 个 WebDAV 账户。</p><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="create-webdav"><label>账户<input name="serviceUsername" required></label><label>密码<input name="servicePassword" type="password" minlength="8" required></label><button class="primary-button" type="submit">创建账户</button></form></article>` : "";
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>账号管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账号管理", `<a class="text-link inverse" href="/">返回管理中心</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("ACCOUNT MANAGEMENT", "账号管理", `当前管理员：${adminUsername}。每个管理员最多拥有两个 WebDAV 账户。`)}<section class="content-grid">${rows}${createForm}</section><section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">NEW ADMIN</p><h2>创建管理员账户</h2></div></div><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="create-admin"><label>管理员账户<input name="adminUsername" required></label><label>管理员密码<input name="adminPassword" type="password" minlength="8" required></label><button class="primary-button" type="submit">创建管理员</button></form></section></main></body></html>`);
 }
 
 async function sessionUser(request: Request, env: Env): Promise<string | null> {
-  const cookie = request.headers.get("Cookie")?.match(/(?:^|; )cf_webdav_session=([^;]+)/)?.[1];
-  return cookie ? env.WEBDAV_KV.get(`${SESSION_PREFIX}${cookie}`) : null;
+  const token = sessionToken(request);
+  return token ? env.WEBDAV_KV.get(`${SESSION_PREFIX}${token}`) : null;
 }
 
 function adminPath(value: string): string {
@@ -1162,8 +1260,8 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     await env.WEBDAV_KV.delete(metaKey(path));
     await adjustAccountStorageUsage(env, -object.size);
 
-    // 记录删除信息到 KV（用于管理界面显示）
-    await env.WEBDAV_KV.put(`${TRASH_PREFIX}${path}`, JSON.stringify(trashMeta), {
+    // 记录删除信息到 KV（用于管理界面显示）；键中的路径必须编码，避免含 % 等字符时与读取侧 decode 不对称
+    await env.WEBDAV_KV.put(`${TRASH_PREFIX}${encodeURIComponent(path)}`, JSON.stringify(trashMeta), {
       expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60,
     });
 
@@ -1201,7 +1299,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
   await deleteMetadataUnder(env, path);
 
   // 记录目录删除信息
-  await env.WEBDAV_KV.put(`${TRASH_PREFIX}${path}`, JSON.stringify({
+  await env.WEBDAV_KV.put(`${TRASH_PREFIX}${encodeURIComponent(path)}`, JSON.stringify({
     originalPath: path,
     deletedAt,
     isDirectory: true,
@@ -1212,9 +1310,19 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
   return new Response(null, { status: 204 });
 }
 
+// 解码回收站 KV 键中的路径：新数据写入时已编码；旧数据未编码，含 % 时 decode 会抛错，需容错回退原样
+function decodeTrashKeyName(keyName: string): string {
+  const encoded = keyName.slice(TRASH_PREFIX.length);
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+}
+
 // 新增：恢复回收站文件
 async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> {
-  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashPath}`, "json") as { originalPath: string; deletedAt: string } | null;
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`, "json") as { originalPath: string; deletedAt: string } | null;
   if (!trashMeta) return textResponse("Not Found in Trash", 404);
 
   // 恢复文件
@@ -1237,14 +1345,14 @@ async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> 
   await adjustAccountStorageUsage(env, restoredBytes);
 
   // 删除回收站记录
-  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
+  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`);
 
   return new Response(null, { status: 204 });
 }
 
 // 新增：从回收站永久删除（单个条目，含目录下的全部对象）
 async function purgeFromTrash(env: Env, trashPath: string): Promise<void> {
-  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashPath}`, "json") as { originalPath: string; deletedAt: string } | null;
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`, "json") as { originalPath: string; deletedAt: string } | null;
   if (!trashMeta) return;
 
   // 删除 __trash/ 下对应的对象（含子目录内容）
@@ -1257,7 +1365,7 @@ async function purgeFromTrash(env: Env, trashPath: string): Promise<void> {
   }
 
   // 删除回收站元数据
-  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
+  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`);
 }
 
 // 新增：清空回收站
@@ -1640,7 +1748,7 @@ async function adminTrashPage(env: Env, accountUsername: string): Promise<Respon
     for (const key of page.keys) {
       const meta = await env.WEBDAV_KV.get(key.name, "json") as { originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean } | null;
       if (meta) {
-        const path = decodeURIComponent(key.name.slice(TRASH_PREFIX.length));
+        const path = decodeTrashKeyName(key.name);
         trashItems.push({ path, ...meta });
       }
     }
