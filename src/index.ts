@@ -47,7 +47,6 @@ const LOG_RETENTION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const startTime = Date.now();
     const pathname = new URL(request.url).pathname;
     const clientIp = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
     const userAgent = request.headers.get("User-Agent") || "";
@@ -68,7 +67,7 @@ export default {
     // 新增：检查流量限制
     const rateLimit = await checkRateLimit(scopedEnv, clientIp, request.method, contentLength);
     if (!rateLimit.allowed) {
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username });
       return new Response("Too Many Requests", {
         status: 429,
         headers: {
@@ -82,7 +81,7 @@ export default {
     try {
       path = requestPath(request, env, webdavAccount);
     } catch {
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username });
       return textResponse("Bad Request", 400);
     }
     let response: Response;
@@ -103,15 +102,15 @@ export default {
       }
     } catch (error) {
       console.error("WebDAV request failed", { method: request.method, path, error });
-      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username });
       return textResponse("Internal Server Error", 500);
     }
-    await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
+    await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: request.method === "PUT" ? contentLength : parseInt(response.headers.get("Content-Length") || "0"), user: username });
     return response;
   },
 };
-// 新增：记录访问日志
-async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }, startTime: number): Promise<void> {
+// 新增：记录访问日志；键以倒序毫秒时间戳开头，KV list 字典序升序即最新在前
+async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }): Promise<void> {
   if (env.ENABLE_ACCESS_LOG !== "true") return;
   const accessLog: AccessLog = {
     timestamp: log.timestamp || new Date().toISOString(),
@@ -124,8 +123,13 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
     user: log.user,
   };
 
-  const logKey = `${LOG_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
+  const logKey = `${LOG_PREFIX}${String(1e13 - Date.now()).padStart(13, "0")}-${Math.random().toString(36).slice(2)}`;
+  try {
+    await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
+  } catch (error) {
+    // 日志写入失败不应影响主请求的响应
+    console.error("Failed to write access log", error);
+  }
 }
 
 async function authenticate(request: Request, env: Env): Promise<WebdavAccount | null> {
@@ -487,7 +491,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
       const userAgent = request.headers.get("User-Agent") || "";
       // 回收站操作统一记录访问日志：恢复记为 PUT、永久删除/清空记为 DELETE
-      const logOperation = (method: string, operationPath: string) => logAccess(env, { method, path: operationPath, status: 200, clientIp, userAgent, user: adminUsername }, Date.now());
+      const logOperation = (method: string, operationPath: string) => logAccess(env, { method, path: operationPath, status: 200, clientIp, userAgent, user: adminUsername });
       if (action === "empty") {
         await emptyTrash(scopedEnv);
         await logOperation("DELETE", "__trash/*");
@@ -517,7 +521,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
-    return view === "logs" ? adminLogsPage(env) : adminPage(request, env);
+    return view === "logs" ? adminLogsPage(env, sessionUser_) : adminPage(request, env);
   }
   // 新增：校验新建 WebDAV 账户的 UUID 是否重复
   if (url.searchParams.get("api") === "check-uuid" && request.method === "GET") {
@@ -541,6 +545,9 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
 }
 
 async function superAdminRequest(request: Request, env: Env, currentAdmin: AdminAccount): Promise<Response> {
+  const url = new URL(request.url);
+  // 超级管理员可查看全量访问日志
+  if (request.method === "GET" && url.searchParams.get("view") === "logs") return adminLogsPage(env);
   if (request.method !== "POST") return superAdminPage(env, "");
   const form = await request.formData();
   const action = String(form.get("action") || "");
@@ -693,7 +700,7 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
   }
-  await logAccess(env, { method: operationMethod, path: operationPath, status: responseStatus, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username }, Date.now());
+  await logAccess(env, { method: operationMethod, path: operationPath, status: responseStatus, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
   return new Response(null, { status: 303, headers: { Location: `/?view=files&account=${encodeURIComponent(accountUsername)}${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}` } });
 }
 
@@ -1559,14 +1566,15 @@ async function checkRateLimit(env: Env, clientIp: string, method: string, conten
 async function adminLogsPage(env: Env, filterUser = ""): Promise<Response> {
   const logs: AccessLog[] = [];
   let cursor: string | undefined;
+  // 日志键为倒序时间戳，list 升序即最新在前：全量视图只需首页，按用户过滤时最多读取 10 页
+  let pagesLeft = filterUser ? 10 : 1;
   do {
     const page = await env.WEBDAV_KV.list({ prefix: LOG_PREFIX, cursor, limit: 100 });
-    for (const key of page.keys) {
-      const log = await env.WEBDAV_KV.get(key.name, "json") as AccessLog | null;
-      if (log) logs.push(log);
-    }
+    const pageLogs = await Promise.all(page.keys.map(async (key) => await env.WEBDAV_KV.get(key.name, "json") as AccessLog | null));
+    for (const log of pageLogs) if (log) logs.push(log);
     cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
+    pagesLeft -= 1;
+  } while (cursor && pagesLeft > 0);
 
   logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   // 普通用户视图仅展示自己的操作日志；超级管理员/管理入口展示全部
@@ -1611,6 +1619,9 @@ th{background:#f6f8fa;font-weight:600}
 .method.MKCOL{background:#e8f5e9;color:#2e7d32}
 .method.COPY,.method.MOVE{background:#f3e5f5;color:#6a1b9a}
 .method.PROPFIND{background:#e0f2f1;color:#00695c}
+.method.HEAD{background:#ede7f6;color:#4527a0}
+.method.LOCK{background:#fff8e1;color:#a67c00}
+.method.UNLOCK{background:#eceff1;color:#455a64}
 .status{padding:2px 6px;border-radius:3px;font-size:12px;font-weight:500}
 .status.success{background:#e8f5e9;color:#2e7d32}
 .status.warn{background:#fff3e0;color:#e65100}
@@ -1669,7 +1680,7 @@ td.check-col{text-align:center}
 a{color:#1769aa;text-decoration:none}[data-theme="dark"] a{color:var(--link-color)}
 a:hover{text-decoration:underline}
 `;
-var DARK_MODE_CSS = `:root{--bg-gradient:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%);--text-primary:#17212b;--text-secondary:#667578;--card-bg:rgba(255,255,255,.82);--card-border:#d7e0dc;--card-shadow:0 12px 30px rgba(31,61,57,.06);--input-bg:#fbfcfa;--input-border:#cbd7d3;--topbar-bg:#183b3f;--topbar-text:#f4f8f5;--table-header-bg:#f2f6f3;--table-header-text:#60716d;--table-border:#e0e7e3;--accent-gold:#d79b41;--accent-gold-hover:#e5ae59;--accent-gold-text:#183b3f;--accent-teal:#397277;--danger-bg:#fff5f3;--danger-border:#c76c61;--danger-text:#a43f35;--secondary-bg:#fff;--secondary-border:#397277;--secondary-text:#285b60;--link-color:#32656a}[data-theme="dark"]{--bg-gradient:linear-gradient(135deg,#0f1a1c 0%,#162628 100%);--text-primary:#c7d7d3;--text-secondary:#91aaa4;--card-bg:rgba(28,46,49,.82);--card-border:#2d484b;--card-shadow:0 12px 30px rgba(0,0,0,.25);--input-bg:#1a2e31;--input-border:#3a5558;--topbar-bg:#0c1618;--topbar-text:#c7d7d3;--table-header-bg:#1a2e31;--table-header-text:#a5bcb7;--table-border:#2d484b;--accent-gold:#e5ae59;--accent-gold-hover:#f0be70;--accent-gold-text:#0f1a1c;--accent-teal:#7ab8b0;--danger-bg:#2a1515;--danger-border:#a43f35;--danger-text:#e88078;--secondary-bg:transparent;--secondary-border:#5a9a9e;--secondary-text:#8fd4d8;--link-color:#7ab8b0}body{background:var(--bg-gradient);color:var(--text-primary)}.muted{color:var(--text-secondary)!important}.topbar{background:var(--topbar-bg);color:var(--topbar-text)}.topbar .text-link,.inverse{color:var(--topbar-text)}.summary-card,.config-card,.file-table-wrap,.data-table-wrap{background:var(--card-bg);border-color:var(--card-border);box-shadow:var(--card-shadow)}.config-form input,.filter-label input,.table-form input,.file-actions input,.mkdir-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.primary-button{background:var(--accent-gold);color:var(--accent-gold-text)}.primary-button:hover{background:var(--accent-gold-hover)}.secondary-button{background:var(--secondary-bg);border-color:var(--secondary-border);color:var(--secondary-text)}.danger-button{background:var(--danger-bg);border-color:var(--danger-border);color:var(--danger-text)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text)}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{border-bottom-color:var(--table-border)}th,td{color:var(--text-primary)}.text-link{color:var(--link-color)}.method.GET{background:#152535;color:#6ab0e8}.method.PUT{background:#2a2015;color:#e8a555}.method.DELETE{background:#2a1515;color:#e88078}.method.MKCOL{background:#152a22;color:#5ec98f}.status.success{background:#152a22;color:#5ec98f}.status.warn{background:#2a2015;color:#e8a555}.status.error{background:#2a1515;color:#e88078}.restore-btn{background:#5ec98f;color:#fff}.empty-btn{background:var(--danger-text)}[data-theme="dark"] h1,[data-theme="dark"] h2,[data-theme="dark"] h3,[data-theme="dark"] label{color:var(--text-primary)}[data-theme="dark"] .card-meta,[data-theme="dark"] .card-label{color:var(--text-secondary)!important}[data-theme="dark"] .user-table tbody th{color:var(--text-primary)}`;
+var DARK_MODE_CSS = `:root{--bg-gradient:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%);--text-primary:#17212b;--text-secondary:#667578;--card-bg:rgba(255,255,255,.82);--card-border:#d7e0dc;--card-shadow:0 12px 30px rgba(31,61,57,.06);--input-bg:#fbfcfa;--input-border:#cbd7d3;--topbar-bg:#183b3f;--topbar-text:#f4f8f5;--table-header-bg:#f2f6f3;--table-header-text:#60716d;--table-border:#e0e7e3;--accent-gold:#d79b41;--accent-gold-hover:#e5ae59;--accent-gold-text:#183b3f;--accent-teal:#397277;--danger-bg:#fff5f3;--danger-border:#c76c61;--danger-text:#a43f35;--secondary-bg:#fff;--secondary-border:#397277;--secondary-text:#285b60;--link-color:#32656a}[data-theme="dark"]{--bg-gradient:linear-gradient(135deg,#0f1a1c 0%,#162628 100%);--text-primary:#c7d7d3;--text-secondary:#91aaa4;--card-bg:rgba(28,46,49,.82);--card-border:#2d484b;--card-shadow:0 12px 30px rgba(0,0,0,.25);--input-bg:#1a2e31;--input-border:#3a5558;--topbar-bg:#0c1618;--topbar-text:#c7d7d3;--table-header-bg:#1a2e31;--table-header-text:#a5bcb7;--table-border:#2d484b;--accent-gold:#e5ae59;--accent-gold-hover:#f0be70;--accent-gold-text:#0f1a1c;--accent-teal:#7ab8b0;--danger-bg:#2a1515;--danger-border:#a43f35;--danger-text:#e88078;--secondary-bg:transparent;--secondary-border:#5a9a9e;--secondary-text:#8fd4d8;--link-color:#7ab8b0}body{background:var(--bg-gradient);color:var(--text-primary)}.muted{color:var(--text-secondary)!important}.topbar{background:var(--topbar-bg);color:var(--topbar-text)}.topbar .text-link,.inverse{color:var(--topbar-text)}.summary-card,.config-card,.file-table-wrap,.data-table-wrap{background:var(--card-bg);border-color:var(--card-border);box-shadow:var(--card-shadow)}.config-form input,.filter-label input,.table-form input,.file-actions input,.mkdir-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.primary-button{background:var(--accent-gold);color:var(--accent-gold-text)}.primary-button:hover{background:var(--accent-gold-hover)}.secondary-button{background:var(--secondary-bg);border-color:var(--secondary-border);color:var(--secondary-text)}.danger-button{background:var(--danger-bg);border-color:var(--danger-border);color:var(--danger-text)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text)}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{border-bottom-color:var(--table-border)}th,td{color:var(--text-primary)}.text-link{color:var(--link-color)}.method.GET{background:#152535;color:#6ab0e8}.method.PUT{background:#2a2015;color:#e8a555}.method.DELETE{background:#2a1515;color:#e88078}.method.MKCOL{background:#152a22;color:#5ec98f}.method.HEAD{background:#1c1a2e;color:#9d8cf0}.method.LOCK{background:#2a2315;color:#e0b74f}.method.UNLOCK{background:#1e2629;color:#90b8c4}.status.success{background:#152a22;color:#5ec98f}.status.warn{background:#2a2015;color:#e8a555}.status.error{background:#2a1515;color:#e88078}.restore-btn{background:#5ec98f;color:#fff}.empty-btn{background:var(--danger-text)}[data-theme="dark"] h1,[data-theme="dark"] h2,[data-theme="dark"] h3,[data-theme="dark"] label{color:var(--text-primary)}[data-theme="dark"] .card-meta,[data-theme="dark"] .card-label{color:var(--text-secondary)!important}[data-theme="dark"] .user-table tbody th{color:var(--text-primary)}`;
 var TABLE_POLISH_CSS = `.data-table-wrap{overflow-x:auto;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow)}.data-table,.user-table,.file-table-wrap table{width:100%;border-collapse:collapse}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{padding:14px 16px;text-align:left;vertical-align:middle;border-bottom:1px solid var(--table-border)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text);font-size:12px;font-weight:800;letter-spacing:.04em}.data-table tbody tr:last-child td,.user-table tbody tr:last-child td,.file-table-wrap tbody tr:last-child td{border-bottom:0}.data-table .path{max-width:320px}.primary-button,.secondary-button,.danger-button,.restore-btn,.empty-btn{min-height:40px;display:inline-flex;align-items:center;justify-content:center;line-height:1.2}.data-table form{margin:0}.method,.status{display:inline-flex;align-items:center;min-height:26px;padding:3px 8px}.empty-form{display:flex;justify-content:flex-end;gap:10px}.empty-btn{margin-top:18px}`;
 const FILES_CSS = `
 .secondary-button{padding:12px 18px;border:1px solid #397277;border-radius:2px;background:#fff;color:#285b60;font:inherit;font-weight:800;cursor:pointer}.inline-button{display:inline-block;margin:12px 0 18px}.file-table-wrap{overflow-x:auto;background:rgba(255,255,255,.82);border:1px solid #d7e0dc}.file-table-wrap table{width:100%;border-collapse:collapse;min-width:640px}.file-table-wrap th,.file-table-wrap td{padding:15px 18px;text-align:left;border-bottom:1px solid #e0e7e3}.file-table-wrap th{background:#f2f6f3;color:#60716d;font-size:12px}.file-name{font-weight:700}.file-name a{color:#285b60}.folder-icon,.file-icon{display:inline-block;width:34px;margin-right:8px;color:#a47735;font-size:9px;font-weight:900}.file-icon{color:#51817c}.danger-button{padding:7px 11px;border:1px solid #c76c61;border-radius:2px;background:#fff5f3;color:#a43f35;font:inherit;font-size:12px;cursor:pointer}.empty-state{text-align:center;color:#71807e;padding:36px!important}
