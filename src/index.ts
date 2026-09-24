@@ -470,11 +470,15 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       return adminFilesAction(request, env, form, sessionUser_, selected.username, selected);
     }
-    if (view === "trash" && ["restore", "empty"].includes(action)) {
+    if (view === "trash" && ["restore", "purge", "empty"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       const scopedEnv = createScopedEnv(env, storageScope(selected));
       if (action === "empty") await emptyTrash(scopedEnv);
+      else if (action === "purge") {
+        const paths = form.getAll("paths").map(String).filter(Boolean);
+        for (const trashPath of paths) await purgeFromTrash(scopedEnv, trashPath);
+      }
       else await restoreFromTrash(scopedEnv, String(form.get("path") || ""));
       return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
@@ -666,7 +670,7 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
     ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`),
     ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td>${formatDateTime(file.uploaded)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
   ].join("");
-    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><div class="topbar-right"><a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">账户：${escapeHtml(accountUsername)}　当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>选择一个文件上传到当前目录</span></div><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>文件管理</span></div><div class="topbar-right"><a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a><a class="text-link inverse" href="/">返回账户选择</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">FILE MANAGER</p><h1>文件管理</h1><p class="muted">账户：${escapeHtml(accountUsername)}　当前位置：/${escapeHtml(currentPath)}</p></div></section><section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>选择一个文件上传到当前目录</span></div><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -904,6 +908,24 @@ async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> 
   await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
 
   return new Response(null, { status: 204 });
+}
+
+// 新增：从回收站永久删除（单个条目，含目录下的全部对象）
+async function purgeFromTrash(env: Env, trashPath: string): Promise<void> {
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashPath}`, "json") as { originalPath: string; deletedAt: string } | null;
+  if (!trashMeta) return;
+
+  // 删除 __trash/ 下对应的对象（含子目录内容）
+  const trashObjects = await listAllObjects(env, `__trash/${TRASH_PREFIX}`);
+  for (const obj of trashObjects) {
+    const customMeta = obj.customMetadata;
+    if (customMeta?.originalPath === trashMeta.originalPath || customMeta?.originalPath?.startsWith(`${trashMeta.originalPath}/`)) {
+      await env.WEBDAV_BUCKET.delete(obj.key);
+    }
+  }
+
+  // 删除回收站元数据
+  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
 }
 
 // 新增：清空回收站
@@ -1230,10 +1252,10 @@ async function adminTrashPage(env: Env, accountUsername: string): Promise<Respon
     const path = escapeXml(item.originalPath);
     const type = item.isDirectory ? "目录" : "文件";
     const size = item.size ? formatBytes(item.size) : "-";
-    return `<tr><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
+    return `<tr><td class="check-col"><input type="checkbox" class="trash-check" form="trash-toolbar-form" name="paths" value="${escapeXml(item.path)}"></td><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" style="display:inline"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form></td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>回收站</span></div><div class="topbar-right"><a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">TRASH</p><h1>回收站</h1><p class="muted">账户：${escapeHtml(accountUsername)}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p></div></section><section class="data-table-wrap"><table class="data-table"><thead><tr><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="5">回收站为空</td></tr>'}</tbody></table></section>${trashItems.length > 0 ? `<form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="empty-form"><input type="hidden" name="action" value="empty"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form>` : ""}</main></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${TRASH_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>回收站</span></div><div class="topbar-right"><a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">TRASH</p><h1>回收站</h1><p class="muted">账户：${escapeHtml(accountUsername)}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理</p></div></section><section class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-col"><input type="checkbox" id="trash-select-all" onchange="toggleTrashSelect(this.checked)" title="全选"></th><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="6">回收站为空</td></tr>'}</tbody></table></section>${trashItems.length > 0 ? `<form id="trash-toolbar-form" method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="trash-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" name="action" value="purge" class="empty-btn" onclick="return confirmTrashPurge()">永久删除选中</button><button type="submit" name="action" value="empty" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form><script>function toggleTrashSelect(checked){document.querySelectorAll('.trash-check').forEach(function(c){c.checked=checked});}function confirmTrashPurge(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要永久删除的文件');return false;}return confirm('确定要永久删除选中的 '+n+' 项吗？此操作不可恢复！');}</script>` : ""}</main></body></html>`);
 }
 
 const TRASH_CSS = `
@@ -1243,6 +1265,10 @@ th{background:#f6f8fa;font-weight:600}
 .restore-btn{padding:4px 12px;background:#2e7d32;color:white;border:0;border-radius:3px;cursor:pointer;font-size:12px}
 .restore-btn:hover{background:#1b5e20}
 .empty-form{margin:20px 0;text-align:center}
+.check-col{width:44px;text-align:center}
+td.check-col{text-align:center}
+.trash-check{width:16px;height:16px;cursor:pointer;vertical-align:middle}
+.trash-toolbar{display:flex;justify-content:flex-end;gap:10px;margin:20px 0}
 .empty-btn{padding:10px 20px;background:#c62828;color:white;border:0;border-radius:5px;cursor:pointer;font-size:14px}
 .empty-btn:hover{background:#b71c1c}
 a{color:#1769aa;text-decoration:none}
