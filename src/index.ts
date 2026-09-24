@@ -614,12 +614,16 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
   const accounts = await getAdminAccounts(env);
   const users = Object.values(accounts).filter((account) => account.role !== "admin");
   const webdavAccounts = await getWebdavAccounts(env);
+  // 汇总所有用户名下 WebDAV 账户的存储用量（GB）
+  const owners = [...new Set(Object.values(webdavAccounts).map((account) => account.owner))];
+  const ownerUsages = await Promise.all(owners.map((owner) => getUserStorageUsage(env, owner)));
+  const usedGb = (ownerUsages.reduce((total, size) => total + size, 0) / 1024 ** 3).toFixed(2);
   const userRows = users.map((user) => {
     const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === user.username);
     const accountRows = ownedAccounts.map((account) => `<div class="account-row"><span>${escapeHtml(account.username)} · ${escapeHtml(account.uuid || "------")}</span><form method="post" style="display:inline" onsubmit="return confirm('确定删除此 WebDAV 账户及其全部文件吗？')"><input type="hidden" name="action" value="delete-webdav-admin"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><button class="danger-button compact-button" type="submit">删除</button></form></div>`).join("");
     return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><button class="danger-button" type="submit">删除用户</button></form></td></tr>`;
   }).join("");
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>超级管理员</span></div><div class="topbar-right"><span class="status-dot">系统管理员</span><a class="text-link" style="color:#dcebe6" href="/?action=logout">退出当前账户</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户与账户管理</h1><p class="muted">管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。</p></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="3" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>超级管理员</span></div><div class="topbar-right"><span class="status-dot">系统管理员</span><a class="text-link" style="color:#dcebe6" href="/?action=logout">退出当前账户</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户与账户管理</h1><p class="muted">管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。</p></div><div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="3" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
 }
 
 function adminLandingPage(request: Request, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string, usedStorage: number): Response {
@@ -672,8 +676,10 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       operationMethod = "PUT";
       const quotaResponse = await ensureStorageCapacity(env, scopedEnv, account, path, file.size);
       if (quotaResponse) return quotaResponse;
+      const existingObject = await scopedEnv.WEBDAV_BUCKET.head(path);
       await scopedEnv.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
       await scopedEnv.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
+      await adjustAccountStorageUsage(scopedEnv, file.size - (existingObject?.size ?? 0));
     } else if (action === "mkdir") {
       const name = String(form.get("name") || "");
       operationPath = adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`);
@@ -1109,6 +1115,7 @@ async function putObject(request: Request, env: Env, path: string, account: Webd
   const object = await env.WEBDAV_BUCKET.put(r2Key(path), request.body, { httpMetadata: { contentType } });
   const metadata: FileMeta = { type: "file", size: object.size, etag: object.httpEtag, contentType, updatedAt: new Date().toISOString() };
   await env.WEBDAV_KV.put(metaKey(path), JSON.stringify(metadata));
+  await adjustAccountStorageUsage(env, object.size - (existingObject?.size ?? 0));
   return new Response(null, { status: 201, headers: { ETag: object.httpEtag } });
 }
 
@@ -1158,6 +1165,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     // 删除原文件
     await env.WEBDAV_BUCKET.delete(r2Key(path));
     await env.WEBDAV_KV.delete(metaKey(path));
+    await adjustAccountStorageUsage(env, -object.size);
 
     // 记录删除信息到 KV（用于管理界面显示）
     await env.WEBDAV_KV.put(`${TRASH_PREFIX}${path}`, JSON.stringify(trashMeta), {
@@ -1175,6 +1183,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
 
   // 软删除目录及其内容
   const objects = await listAllObjects(env, `${path}/`);
+  const removedBytes = objects.reduce((total, item) => total + item.size, 0);
   const deletedAt = new Date().toISOString();
 
   // 移动文件到回收站
@@ -1203,6 +1212,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     isDirectory: true,
     fileCount: objects.length,
   }), { expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60 });
+  await adjustAccountStorageUsage(env, -removedBytes);
 
   return new Response(null, { status: 204 });
 }
@@ -1214,6 +1224,7 @@ async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> 
 
   // 恢复文件
   const trashObjects = await listAllObjects(env, `__trash/${TRASH_PREFIX}`);
+  let restoredBytes = 0;
   for (const obj of trashObjects) {
     const customMeta = obj.customMetadata;
     if (customMeta?.originalPath === trashMeta.originalPath || customMeta?.originalPath?.startsWith(`${trashMeta.originalPath}/`)) {
@@ -1222,10 +1233,13 @@ async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> 
         await env.WEBDAV_BUCKET.put(customMeta.originalPath, content.body, {
           httpMetadata: content.httpMetadata,
         });
+        restoredBytes += content.size;
       }
       await env.WEBDAV_BUCKET.delete(obj.key);
     }
   }
+  // 回收站对象不计入用量，恢复后重新计入
+  await adjustAccountStorageUsage(env, restoredBytes);
 
   // 删除回收站记录
   await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashPath}`);
@@ -1299,6 +1313,8 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
       await env.WEBDAV_BUCKET.delete(r2Key(source));
       await env.WEBDAV_KV.delete(metaKey(source));
     }
+    // 覆盖写入目标：copy 净增源大小减去被覆盖目标；move 时源随后被移除，净减被覆盖目标
+    await adjustAccountStorageUsage(env, move ? -(destinationObject?.size ?? 0) : sourceObject.size - (destinationObject?.size ?? 0));
     return new Response(null, { status: 201 });
   }
   if (!(await hasChildren(env, source)) && !(await env.WEBDAV_KV.get(dirKey(source)))) return textResponse("Not Found", 404);
@@ -1308,6 +1324,7 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
     if (descendantLocks.length) return textResponse("Locked descendant resources", 423);
   }
   const objects = await listAllObjects(env, `${source}/`);
+  const sourceDirBytes = objects.reduce((total, item) => total + item.size, 0);
   for (const item of objects) {
     const body = await env.WEBDAV_BUCKET.get(item.key);
     if (body) await env.WEBDAV_BUCKET.put(`${destination}/${item.key.slice(source.length + 1)}`, body.body, { httpMetadata: body.httpMetadata });
@@ -1320,6 +1337,8 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
     }
   }
   if (move) await deletePath(env, source);
+  // 目录复制净增源目录字节数；move 时下方 deletePath 已扣除源目录，两者相抵
+  await adjustAccountStorageUsage(env, sourceDirBytes);
   await env.WEBDAV_KV.put(dirKey(destination), new Date().toISOString());
   return new Response(null, { status: 201 });
 }
@@ -1428,13 +1447,28 @@ async function storageSizeAtPath(env: Env, path: string): Promise<number> {
   return objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
 }
 
+const STORAGE_USAGE_KEY = "storage-usage";
+
+// 读取账户存储用量 KV 缓存（不含 __trash/ 回收站对象）；缓存缺失时全量扫描 R2 重建
+async function getAccountStorageUsage(env: Env): Promise<number> {
+  const cached = await env.WEBDAV_KV.get(STORAGE_USAGE_KEY, "json") as { bytes: number } | null;
+  if (cached && Number.isFinite(cached.bytes)) return cached.bytes;
+  const objects = await listAllObjects(env, "");
+  const bytes = objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
+  await env.WEBDAV_KV.put(STORAGE_USAGE_KEY, JSON.stringify({ bytes, updatedAt: new Date().toISOString() }));
+  return bytes;
+}
+
+// 写操作后增量更新账户存储用量缓存；KV 读改写非原子，极端并发下可能有少量漂移
+async function adjustAccountStorageUsage(env: Env, delta: number): Promise<void> {
+  if (!delta) return;
+  const current = await getAccountStorageUsage(env);
+  await env.WEBDAV_KV.put(STORAGE_USAGE_KEY, JSON.stringify({ bytes: Math.max(0, current + delta), updatedAt: new Date().toISOString() }));
+}
+
 async function getUserStorageUsage(env: Env, owner: string): Promise<number> {
   const accounts = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === owner);
-  const sizes = await Promise.all(accounts.map(async (account) => {
-    const scopedEnv = createScopedEnv(env, storageScope(account));
-    const objects = await listAllObjects(scopedEnv, "");
-    return objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
-  }));
+  const sizes = await Promise.all(accounts.map((account) => getAccountStorageUsage(createScopedEnv(env, storageScope(account)))));
   return sizes.reduce((total, size) => total + size, 0);
 }
 
