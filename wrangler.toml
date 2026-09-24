@@ -21,3 +21,4 @@ bucket_name = "cf-webdav-files-helyel2332"
 # 留空表示根路径；如需添加固定前缀，可设置为 "team-files"
 DAV_PREFIX = ""
 # true 时启用访问日志，可在后台查看
+ENABLE_ACCESS_LOG = "true"

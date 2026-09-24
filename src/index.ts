@@ -68,7 +68,7 @@ export default {
     // 新增：检查流量限制
     const rateLimit = await checkRateLimit(scopedEnv, clientIp, request.method, contentLength);
     if (!rateLimit.allowed) {
-      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 429, clientIp, userAgent, user: username }, startTime);
       return new Response("Too Many Requests", {
         status: 429,
         headers: {
@@ -82,7 +82,7 @@ export default {
     try {
       path = requestPath(request, env, webdavAccount);
     } catch {
-      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path: pathname, status: 400, clientIp, userAgent, user: username }, startTime);
       return textResponse("Bad Request", 400);
     }
     let response: Response;
@@ -103,10 +103,10 @@ export default {
       }
     } catch (error) {
       console.error("WebDAV request failed", { method: request.method, path, error });
-      await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
+      await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: 500, clientIp, userAgent, user: username }, startTime);
       return textResponse("Internal Server Error", 500);
     }
-    await logAccess(scopedEnv, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
+    await logAccess(env, { timestamp: new Date().toISOString(), method: request.method, path, status: response.status, clientIp, userAgent, bytesSent: parseInt(response.headers.get("Content-Length") || "0"), user: username }, startTime);
     return response;
   },
 };
@@ -484,18 +484,22 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       const scopedEnv = createScopedEnv(env, storageScope(selected));
-      if (action === "empty") await emptyTrash(scopedEnv);
-      else if (action === "purge") {
+      const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
+      const userAgent = request.headers.get("User-Agent") || "";
+      // 回收站操作统一记录访问日志：恢复记为 PUT、永久删除/清空记为 DELETE
+      const logOperation = (method: string, operationPath: string) => logAccess(env, { method, path: operationPath, status: 200, clientIp, userAgent, user: adminUsername }, Date.now());
+      if (action === "empty") {
+        await emptyTrash(scopedEnv);
+        await logOperation("DELETE", "__trash/*");
+      } else if (action === "purge") {
         const paths = form.getAll("paths").map(String).filter(Boolean);
         for (const trashPath of paths) await purgeFromTrash(scopedEnv, trashPath);
-      }
-      else if (action === "restore") {
+        for (const trashPath of paths) await logOperation("DELETE", trashPath);
+      } else if (action === "restore") {
         const paths = form.getAll("paths").map(String).filter(Boolean);
-        if (paths.length) {
-          for (const trashPath of paths) await restoreFromTrash(scopedEnv, trashPath);
-        } else {
-          await restoreFromTrash(scopedEnv, String(form.get("path") || ""));
-        }
+        const restoredPaths = paths.length ? paths : [String(form.get("path") || "")].filter(Boolean);
+        for (const trashPath of restoredPaths) await restoreFromTrash(scopedEnv, trashPath);
+        for (const trashPath of restoredPaths) await logOperation("PUT", trashPath);
       }
       return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
@@ -528,7 +532,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   const selectedAccount = (await getWebdavAccounts(env))[requestedAccount || ""];
   if (selectedAccount && selectedAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
   if (view === "account") return selectedAccount ? adminAccountPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
-  if (view === "logs") return adminLogsPage(selectedAccount ? createScopedEnv(env, storageScope(selectedAccount)) : env);
+  if (view === "logs") return adminLogsPage(env, sessionUser_);
   if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "accounts") return adminPage(request, env);
@@ -1552,7 +1556,7 @@ async function checkRateLimit(env: Env, clientIp: string, method: string, conten
 }
 
 // 新增：访问日志页面
-async function adminLogsPage(env: Env): Promise<Response> {
+async function adminLogsPage(env: Env, filterUser = ""): Promise<Response> {
   const logs: AccessLog[] = [];
   let cursor: string | undefined;
   do {
@@ -1565,7 +1569,9 @@ async function adminLogsPage(env: Env): Promise<Response> {
   } while (cursor);
 
   logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  const recentLogs = logs.slice(0, 100);
+  // 普通用户视图仅展示自己的操作日志；超级管理员/管理入口展示全部
+  const visibleLogs = filterUser ? logs.filter((log) => log.user === filterUser) : logs;
+  const recentLogs = visibleLogs.slice(0, 100);
 
   const logRows = recentLogs.map(log => {
     const time = new Date(log.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
