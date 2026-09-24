@@ -282,6 +282,7 @@ curl -i -u admin:change-this-local-password http://localhost:8787/docs/hello.txt
 - `R2` 保存文件字节内容，`KV` 保存可重建的元数据和目录状态
 - 读取文件时优先以 R2 为准；KV 异常或延迟不会破坏文件内容
 - 支持 `Depth: 0`、`Depth: 1` 和 `Depth: infinity`，兼容需要递归读取目录的客户端
+- 支持 RFC 4918 Class 2 锁机制（LOCK/UNLOCK）、Range 部分内容（206）、If-Match/If-None-Match 条件请求及 RFC 4331 配额属性
 - 当前实现是单管理员 Basic Auth，适合个人或小规模网盘使用
 
 ## 注意事项
@@ -289,6 +290,7 @@ curl -i -u admin:change-this-local-password http://localhost:8787/docs/hello.txt
 - 首次部署后请尽快修改默认管理员密码
 - 生产环境建议始终使用 HTTPS
 - 不要在日志中记录 Authorization header 或文件内容
+- LOCK/UNLOCK 锁信息存储在 KV 上，受 KV 最终一致性（跨节点传播可达 60 秒）与读-改-写非原子性影响，锁为"建议性锁"：可协调行为良好的客户端（如 Office 编辑器）的 LOCK-EDIT-UNLOCK 流程，但不能提供强互斥保证，不适合用于防并发覆盖的强一致场景
 - 若资源名已被占用，请更换随机后缀，例如：
   - `cf-webdav-kv-a1b2c3`
   - `cf-webdav-files-xyz789`

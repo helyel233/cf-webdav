@@ -38,6 +38,9 @@ const WEBDAV_ACCOUNTS_KEY = "config:webdav-accounts";
 const SESSION_PREFIX = "session:";
 const LOG_PREFIX = "log:";
 const TRASH_PREFIX = "trash:";
+const LOCK_PREFIX = "davlock:";
+const LOCK_DEFAULT_TIMEOUT = 600;
+const LOCK_MAX_TIMEOUT = 3600;
 const DEFAULT_USERNAME = "admin";
 const DEFAULT_PASSWORD = "admin123456";
 const SESSION_TTL = 60 * 60 * 24 * 7;
@@ -86,14 +89,16 @@ export default {
     let response: Response;
     try {
       switch (request.method) {
-        case "PROPFIND": response = await propfind(request, scopedEnv, path, webdavAccount); break;
+        case "PROPFIND": response = await propfind(request, scopedEnv, path, webdavAccount, env); break;
         case "GET": response = await getObject(scopedEnv, path, false, request); break;
         case "HEAD": response = await getObject(scopedEnv, path, true, request); break;
         case "PUT": response = await putObject(request, scopedEnv, path, webdavAccount, env); break;
-        case "DELETE": response = await deletePath(scopedEnv, path); break;
-        case "MKCOL": response = await makeCollection(scopedEnv, path); break;
+        case "DELETE": response = await deletePath(scopedEnv, path, request); break;
+        case "MKCOL": response = await makeCollection(scopedEnv, path, request); break;
         case "COPY": response = await copyOrMove(request, scopedEnv, path, false, webdavAccount, env); break;
         case "MOVE": response = await copyOrMove(request, scopedEnv, path, true, webdavAccount, env); break;
+        case "LOCK": response = await lockResource(request, scopedEnv, path, username, webdavAccount); break;
+        case "UNLOCK": response = await unlockResource(request, scopedEnv, path); break;
         default:
           response = textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
       }
@@ -617,10 +622,12 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>超级管理员</span></div><div class="topbar-right"><span class="status-dot">系统管理员</span><a class="text-link" style="color:#dcebe6" href="/?action=logout">退出当前账户</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户与账户管理</h1><p class="muted">管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。</p></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="3" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
 }
 
-function adminLandingPage(request: Request, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string): Response {
+function adminLandingPage(request: Request, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string, usedStorage: number): Response {
+  const usedGb = (usedStorage / 1024 ** 3).toFixed(2);
+  const totalGb = String(USER_STORAGE_LIMIT / 1024 ** 3);
   const accountCards = accounts.map((account) => `<a class="config-card account-card account-choice" href="/?view=account&account=${encodeURIComponent(account.username)}"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">账户链接：${escapeHtml(webdavAccountUrl(request, account))}</p><span class="primary-button inline-button">进入账户管理</span></a>`).join("");
   const createForm = accounts.length < 2 ? `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">NEW ACCOUNT</p><h2>新建 WebDAV 账户</h2></div><span class="icon-badge">+</span></div><p class="muted">当前管理员最多拥有 2 个 WebDAV 账户。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="create-webdav"><label>账户<input name="serviceUsername" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" required></label><label>6 位 UUID<div class="uuid-row"><input name="accountUuid" value="${escapeHtml(nextUuid)}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required><button type="button" class="secondary-button uuid-check-btn" onclick="return checkUuidAvailability(this)">检查 UUID</button></div><span id="uuid-check-result" class="uuid-result"></span></label><button class="primary-button" type="submit">创建 WebDAV 账户</button></form></article>` : "";
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>用户管理</span></div><div class="topbar-right"><span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link" style="color:#dcebe6" href="/?view=change-password">修改密码</a><a class="text-link" style="color:#dcebe6" href="/?action=logout">退出登录</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">USER MANAGEMENT</p><h1>用户管理</h1><p class="muted">进入账户后只能管理该账户自己的文件。</p></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="brand-mark small">WD</span><span>用户管理</span></div><div class="topbar-right"><span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link" style="color:#dcebe6" href="/?view=change-password">修改密码</a><a class="text-link" style="color:#dcebe6" href="/?action=logout">退出登录</a></div></div></header><main class="dashboard"><section class="page-heading"><div><p class="eyebrow">USER MANAGEMENT</p><h1>用户管理</h1><p class="muted">进入账户后只能管理该账户自己的文件。</p></div><div class="storage-badge"><span>当前已用容量（GB）：<strong>${usedGb}</strong></span><span>总容量（GB）：<strong>${totalGb}</strong></span></div></section>${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
 }
 
 async function adminAccountPage(request: Request, env: Env, account: WebdavAccount): Promise<Response> {
@@ -726,7 +733,8 @@ async function adminPage(request: Request, env: Env, message = ""): Promise<Resp
   const adminUsername = await sessionUser(request, env) || DEFAULT_USERNAME;
   const allAccounts = await getWebdavAccounts(env);
   const ownedAccounts = Object.values(allAccounts).filter((account) => account.owner === adminUsername);
-  return adminLandingPage(request, adminUsername, ownedAccounts, createAccountUuid(new Set(Object.values(allAccounts).map((account) => account.uuid).filter((uuid): uuid is string => Boolean(uuid)))), message);
+  const usedStorage = await getUserStorageUsage(env, adminUsername);
+  return adminLandingPage(request, adminUsername, ownedAccounts, createAccountUuid(new Set(Object.values(allAccounts).map((account) => account.uuid).filter((uuid): uuid is string => Boolean(uuid)))), message, usedStorage);
   const firstAccount = ownedAccounts[0];
   const service = firstAccount ? { url: firstAccount.url, username: firstAccount.username, password: "" } : await getServiceConfig(request, env);
   const fileCount = (await Promise.all(ownedAccounts.map((account) => listAllObjects(createScopedEnv(env, storageScope(account)), "")))).flat().filter((item) => !item.key.startsWith("__trash/")).length;
@@ -802,15 +810,83 @@ function dirKey(path: string): string {
 function optionsResponse(): Response {
   return new Response(null, {
     status: 204,
-    headers: { Allow: METHODS.join(", "), DAV: "1", "MS-Author-Via": "DAV" },
+    headers: { Allow: METHODS.join(", "), DAV: "1, 2", "MS-Author-Via": "DAV" },
   });
+}
+
+// 新增：ETag 匹配比较（支持 * 与逗号分隔列表，忽略引号与弱化前缀）
+function etagMatches(headerValue: string, etag: string): boolean {
+  const target = etag.replace(/^W\//, "").replace(/"/g, "");
+  if (headerValue.trim() === "*") return true;
+  return headerValue.split(",").map((candidate) => candidate.trim().replace(/^W\//, "").replace(/"/g, "")).some((candidate) => candidate === target);
+}
+
+// 新增：解析单个 Range 头（仅支持单区间，多区间或非法值回退为 200 全量）
+function parseSingleRange(header: string | null, size: number): { start: number; end: number } | "invalid" | "unsatisfiable" | null {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || (match[1] === "" && match[2] === "")) return "invalid";
+  let start: number;
+  let end: number;
+  if (match[1] === "") {
+    const suffix = Number(match[2]);
+    if (suffix === 0) return "unsatisfiable";
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === "" ? size - 1 : Math.min(Number(match[2]), size - 1);
+  }
+  if (start >= size) return "unsatisfiable";
+  if (start > end) return "invalid";
+  return { start, end };
+}
+
+// 新增：If-Range 校验（ETag 或 HTTP 日期，秒级精度）
+function ifRangeSatisfied(ifRange: string, etag: string, uploaded: Date): boolean {
+  const value = ifRange.trim();
+  if (value.startsWith("\"") || value.startsWith("W/")) return etagMatches(value, etag);
+  const headerTime = new Date(value).getTime();
+  return !Number.isNaN(headerTime) && Math.floor(headerTime / 1000) === Math.floor(uploaded.getTime() / 1000);
+}
+
+// 新增：GET/HEAD 读写条件评估（If-Match → 412，If-None-Match → 304）
+function evaluateReadPrecondition(request: Request, etag: string): Response | null {
+  const ifMatch = request.headers.get("If-Match");
+  if (ifMatch && !etagMatches(ifMatch, etag)) return textResponse("Precondition Failed", 412);
+  const ifNoneMatch = request.headers.get("If-None-Match");
+  if (ifNoneMatch && etagMatches(ifNoneMatch, etag)) return new Response(null, { status: 304, headers: { ETag: etag } });
+  return null;
+}
+
+// 新增：写操作（PUT/DELETE/COPY/MOVE）条件评估，资源不存在时 etag 传 null
+function evaluateMutatingPrecondition(request: Request, etag: string | null): Response | null {
+  const ifMatch = request.headers.get("If-Match");
+  if (ifMatch && (!etag || !etagMatches(ifMatch, etag))) return textResponse("Precondition Failed", 412);
+  const ifNoneMatch = request.headers.get("If-None-Match");
+  if (ifNoneMatch && etag && etagMatches(ifNoneMatch, etag)) return textResponse("Precondition Failed", 412);
+  return null;
 }
 
 async function getObject(env: Env, path: string, head: boolean, request: Request): Promise<Response> {
   if (!path) return textResponse("A directory cannot be downloaded", 405);
   const rangeHeader = request.headers.get("Range");
-  const object = rangeHeader
-    ? await env.WEBDAV_BUCKET.get(r2Key(path), { range: request.headers })
+  const ifRange = request.headers.get("If-Range");
+  const needsMetadata = Boolean(rangeHeader || ifRange || request.headers.get("If-Match") || request.headers.get("If-None-Match"));
+  const fullObject = needsMetadata ? await env.WEBDAV_BUCKET.head(r2Key(path)) : null;
+  if (needsMetadata && !fullObject) return textResponse("Not Found", 404);
+  if (fullObject) {
+    const failed = evaluateReadPrecondition(request, fullObject.httpEtag);
+    if (failed) return failed;
+  }
+  let range: { start: number; end: number } | null = null;
+  if (rangeHeader && fullObject) {
+    const parsed = parseSingleRange(rangeHeader, fullObject.size);
+    if (parsed === "unsatisfiable") return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${fullObject.size}`, ETag: fullObject.httpEtag } });
+    if (parsed && parsed !== "invalid") range = ifRange && !ifRangeSatisfied(ifRange, fullObject.httpEtag, fullObject.uploaded) ? null : parsed;
+  }
+  const object = range
+    ? await env.WEBDAV_BUCKET.get(r2Key(path), { range: { offset: range.start, length: range.end - range.start + 1 } })
     : await env.WEBDAV_BUCKET.get(r2Key(path));
   if (!object) return textResponse("Not Found", 404);
   const headers = new Headers();
@@ -819,22 +895,212 @@ async function getObject(env: Env, path: string, head: boolean, request: Request
   headers.set("Accept-Ranges", "bytes");
   headers.set("Content-Length", String(object.size));
   let status = 200;
-  if (rangeHeader && object.range) {
-    const fullObject = await env.WEBDAV_BUCKET.head(r2Key(path));
-    if (fullObject) {
-      const range = object.range;
-      const start = "suffix" in range
-        ? Math.max(0, fullObject.size - object.size)
-        : range.offset ?? 0;
-      headers.set("Content-Range", `bytes ${start}-${start + object.size - 1}/${fullObject.size}`);
-      status = 206;
-    }
+  if (range && fullObject) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.start + object.size - 1}/${fullObject.size}`);
+    status = 206;
   }
   return new Response(head ? null : object.body, { status, headers });
 }
 
+// 新增：RFC 4918 Class 2 锁机制（锁信息存 KV，过期情性清理）
+interface LockInfo {
+  token: string;
+  owner: string;
+  depth: "0" | "infinity";
+  timeout: number;
+  expiresAt: number;
+  scope: "exclusive" | "shared";
+}
+
+function lockKey(path: string): string {
+  return `${LOCK_PREFIX}${encodeURIComponent(path)}`;
+}
+
+// 同一路径可挂多把锁（shared 共存），KV 值为 LockInfo 数组，兼容旧的单锁格式
+async function readLocks(env: Env, path: string): Promise<LockInfo[]> {
+  const key = lockKey(path);
+  const raw = await env.WEBDAV_KV.get(key, "json") as LockInfo[] | LockInfo | null;
+  if (!raw) return [];
+  const stored = Array.isArray(raw) ? raw : [raw];
+  const active = stored.filter((lock) => lock.expiresAt >= Date.now());
+  if (active.length !== stored.length) await writeLocks(env, path, active);
+  return active;
+}
+
+async function writeLocks(env: Env, path: string, locks: LockInfo[]): Promise<void> {
+  const key = lockKey(path);
+  if (!locks.length) {
+    await env.WEBDAV_KV.delete(key);
+    return;
+  }
+  const ttl = Math.max(60, Math.ceil((Math.max(...locks.map((lock) => lock.expiresAt)) - Date.now()) / 1000));
+  await env.WEBDAV_KV.put(key, JSON.stringify(locks), { expirationTtl: ttl });
+}
+
+// 查找覆盖指定路径的活动锁：精确匹配任意 depth；祖先锁仅 infinity 生效，memberChange 时（新建/删除集合成员）depth-0 集合锁同样生效（RFC 4918 §7.5）
+async function findActiveLocks(env: Env, path: string, memberChange = false): Promise<LockInfo[]> {
+  const segments = path ? path.split("/") : [];
+  const result: LockInfo[] = [];
+  for (let index = segments.length; index >= 0; index--) {
+    const candidate = segments.slice(0, index).join("/");
+    for (const lock of await readLocks(env, candidate)) {
+      if (index === segments.length || lock.depth === "infinity" || memberChange) result.push(lock);
+    }
+  }
+  return result;
+}
+
+// 扫描 path/ 之下成员上的锁（目录递归删除/移动时需提交这些 token，RFC 4918 §7.5.2）
+async function findConflictingDescendantLocks(env: Env, path: string, request?: Request): Promise<LockInfo[]> {
+  if (!request) return [];
+  const locks: LockInfo[] = [];
+  for (const name of await listAllKV(env, LOCK_PREFIX)) {
+    const descendant = decodeURIComponent(name.slice(LOCK_PREFIX.length));
+    if (!descendant.startsWith(`${path}/`)) continue;
+    locks.push(...await readLocks(env, descendant));
+  }
+  if (!locks.length) return [];
+  const provided = extractIfTokens(request.headers.get("If") ?? "", path);
+  return locks.filter((lock) => !provided.includes(lock.token));
+}
+
+// 解析 RFC 4918 If 头：未标记列表作用于当前资源；带资源标签的列表仅当标签指向当前路径时生效；Not 修饰的 token 不作为提交凭证
+function extractIfTokens(headerValue: string | null, path: string): string[] {
+  if (!headerValue) return [];
+  const result: string[] = [];
+  const listRegex = /(?:<([^>]+)>)?\s*\(([^()]*)\)/g;
+  let listMatch: RegExpExecArray | null;
+  while ((listMatch = listRegex.exec(headerValue))) {
+    if (listMatch[1] && !ifTagMatchesPath(listMatch[1], path)) continue;
+    const itemRegex = /(Not\s+)?<([^>]+)>|\[[^\]]*\]/g;
+    let itemMatch: RegExpExecArray | null;
+    while ((itemMatch = itemRegex.exec(listMatch[2]))) {
+      if (!itemMatch[1] && itemMatch[2]?.startsWith("opaquelocktoken:")) result.push(itemMatch[2]);
+    }
+  }
+  return result;
+}
+
+function ifTagMatchesPath(tag: string, path: string): boolean {
+  try {
+    const decoded = decodeURIComponent(new URL(tag).pathname).replace(/\/+$/, "");
+    if (path === "") return decoded === "" || decoded === "/";
+    return decoded === `/${path}` || decoded.endsWith(`/${path}`);
+  } catch {
+    return false;
+  }
+}
+
+// 写操作锁校验：存在未提交 token 的活动锁时返回 423
+async function assertUnlocked(env: Env, path: string, request?: Request, memberChange = false): Promise<Response | null> {
+  if (!request) return null;
+  const locks = await findActiveLocks(env, path, memberChange);
+  if (!locks.length) return null;
+  const provided = [...extractIfTokens(request.headers.get("If") ?? "", path), ...extractIfTokens(request.headers.get("Lock-Token") ?? "", path)];
+  if (locks.some((lock) => provided.includes(lock.token))) return null;
+  return textResponse("Resource is locked", 423);
+}
+
+// 写操作条件请求评估（If-Match / If-None-Match），无相关头时跳过查询
+async function precondition(env: Env, path: string, request: Request): Promise<Response | null> {
+  const ifMatch = request.headers.get("If-Match");
+  const ifNoneMatch = request.headers.get("If-None-Match");
+  if (!ifMatch && !ifNoneMatch) return null;
+  const object = await env.WEBDAV_BUCKET.head(r2Key(path));
+  return evaluateMutatingPrecondition(request, object?.httpEtag ?? null);
+}
+
+function parseTimeoutHeader(value: string | null): number {
+  if (value) {
+    for (const part of value.split(",")) {
+      const match = /Second-(\d+)/i.exec(part.trim());
+      if (match) return Math.min(Math.max(1, Number(match[1])), LOCK_MAX_TIMEOUT);
+    }
+  }
+  return LOCK_DEFAULT_TIMEOUT;
+}
+
+function extractLockOwner(body: string, fallback: string): string {
+  const match = /<(?:[\w-]+:)?owner[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?owner>/i.exec(body);
+  return match ? match[1].trim() : fallback;
+}
+
+function activeLockXml(lock: LockInfo, lockroot: string): string {
+  return `<d:activelock><d:locktype><d:write/></d:locktype><d:lockscope><d:${lock.scope}/></d:lockscope><d:depth>${lock.depth}</d:depth><d:owner>${escapeXml(lock.owner)}</d:owner><d:timeout>Second-${lock.timeout}</d:timeout><d:locktoken><d:href>${escapeXml(lock.token)}</d:href></d:locktoken><d:lockroot><d:href>${escapeXml(lockroot)}</d:href></d:lockroot></d:activelock>`;
+}
+
+function lockDiscoveryXml(lock: LockInfo, lockroot: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?><d:prop xmlns:d="DAV:"><d:lockdiscovery>${activeLockXml(lock, lockroot)}</d:lockdiscovery></d:prop>`;
+}
+
+async function lockResource(request: Request, env: Env, path: string, username: string, account?: WebdavAccount): Promise<Response> {
+  if (!path) return textResponse("A resource path is required", 400);
+  const body = await request.text();
+  const timeout = parseTimeoutHeader(request.headers.get("Timeout"));
+  const depthHeader = (request.headers.get("Depth") ?? "infinity").trim().toLowerCase();
+  if (depthHeader !== "0" && depthHeader !== "infinity") return textResponse("Invalid Depth header", 400);
+  const depth: "0" | "infinity" = depthHeader;
+  const scope: "exclusive" | "shared" = /<(?:[\w-]+:)?shared[\s/>]/i.test(body) ? "shared" : "exclusive";
+  const existing = await readLocks(env, path);
+  const providedIf = extractIfTokens(request.headers.get("If") ?? "", path);
+  const lockroot = `${new URL(request.url).origin}${urlPath(env, path, account)}`;
+  if (!body.trim()) {
+    // 空请求体 = 刷新现有锁，必须通过 If 头提交对应锁 token（RFC 4918 §7.7）
+    const target = existing.find((lock) => providedIf.includes(lock.token));
+    if (!existing.length) return textResponse("No lock exists", 409);
+    if (!target) return textResponse("Precondition Failed", 412);
+    const refreshed: LockInfo = { ...target, timeout, expiresAt: Date.now() + timeout * 1000 };
+    await writeLocks(env, path, existing.map((lock) => (lock.token === target.token ? refreshed : lock)));
+    return new Response(lockDiscoveryXml(refreshed, lockroot), { status: 200, headers: { "Content-Type": "application/xml; charset=utf-8" } });
+  }
+  if (!/<lockinfo[\s/>]/i.test(body)) return textResponse("Invalid lock request body", 400);
+  // 冲突检查：exclusive 与任何现存锁互斥，shared 之间可共存（RFC 4918 §6.1）
+  const directConflict = existing.find((lock) => lock.scope === "exclusive" || (lock.scope === "shared" && scope === "exclusive"));
+  if (directConflict && !providedIf.includes(directConflict.token)) return textResponse("Resource is already locked", 423);
+  const ancestorConflict = (await findActiveLocks(env, path, true)).filter((lock) => !existing.some((candidate) => candidate.token === lock.token)).find((lock) => lock.scope === "exclusive" || (lock.scope === "shared" && scope === "exclusive"));
+  if (ancestorConflict && !providedIf.includes(ancestorConflict.token)) return textResponse("Ancestor collection is locked", 423);
+  // Depth: infinity 加锁需检查后代成员上冲突的锁（RFC 4918 §7.5）
+  if (depth === "infinity") {
+    const descendantConflict = (await findConflictingDescendantLocks(env, path, request)).find((lock) => lock.scope === "exclusive" || (lock.scope === "shared" && scope === "exclusive"));
+    if (descendantConflict) return textResponse("Descendant resource is locked", 423);
+  }
+  // 锁定未映射 URL 时创建空资源（RFC 4918 §7.3）
+  if (!(await env.WEBDAV_BUCKET.head(r2Key(path))) && !(await env.WEBDAV_KV.get(dirKey(path)))) {
+    const object = await env.WEBDAV_BUCKET.put(r2Key(path), "", { httpMetadata: { contentType: "application/octet-stream" } });
+    const metadata: FileMeta = { type: "file", size: object.size, etag: object.httpEtag, contentType: "application/octet-stream", updatedAt: new Date().toISOString() };
+    await env.WEBDAV_KV.put(metaKey(path), JSON.stringify(metadata));
+  }
+  const lock: LockInfo = {
+    token: `opaquelocktoken:${crypto.randomUUID()}`,
+    owner: extractLockOwner(body, username),
+    depth,
+    timeout,
+    expiresAt: Date.now() + timeout * 1000,
+    scope,
+  };
+  await writeLocks(env, path, [...existing, lock]);
+  return new Response(lockDiscoveryXml(lock, lockroot), { status: 200, headers: { "Content-Type": "application/xml; charset=utf-8", "Lock-Token": `<${lock.token}>` } });
+}
+
+async function unlockResource(request: Request, env: Env, path: string): Promise<Response> {
+  if (!path) return textResponse("A resource path is required", 400);
+  const tokens = extractIfTokens(request.headers.get("Lock-Token") ?? "", path);
+  const locks = await readLocks(env, path);
+  if (!locks.length) return textResponse("No lock exists", 409);
+  const remaining = locks.filter((lock) => !tokens.includes(lock.token));
+  if (remaining.length === locks.length) return textResponse("Lock token does not match", 403);
+  await writeLocks(env, path, remaining);
+  return new Response(null, { status: 204 });
+}
+
 async function putObject(request: Request, env: Env, path: string, account: WebdavAccount, rootEnv: Env): Promise<Response> {
   if (!path) return textResponse("A file path is required", 400);
+  const preconditionResponse = await precondition(env, path, request);
+  if (preconditionResponse) return preconditionResponse;
+  // 覆盖已存在文件只是内容修改；新建文件属于向集合内创建成员，需受 depth-0 集合锁保护
+  const existingObject = await env.WEBDAV_BUCKET.head(r2Key(path));
+  const lockResponse = await assertUnlocked(env, path, request, !existingObject);
+  if (lockResponse) return lockResponse;
   const contentLength = Number(request.headers.get("Content-Length"));
   if (!Number.isSafeInteger(contentLength) || contentLength < 0) return textResponse("Content-Length is required", 411);
   const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, path, contentLength);
@@ -846,18 +1112,31 @@ async function putObject(request: Request, env: Env, path: string, account: Webd
   return new Response(null, { status: 201, headers: { ETag: object.httpEtag } });
 }
 
-async function makeCollection(env: Env, path: string): Promise<Response> {
+async function makeCollection(env: Env, path: string, request?: Request): Promise<Response> {
   if (!path) return textResponse("The root collection already exists", 405);
+  if (request) {
+    const lockResponse = await assertUnlocked(env, path, request, true);
+    if (lockResponse) return lockResponse;
+  }
   if (await env.WEBDAV_KV.get(dirKey(path)) || await env.WEBDAV_BUCKET.head(r2Key(path))) return textResponse("Collection already exists", 405);
   await env.WEBDAV_KV.put(dirKey(path), new Date().toISOString());
   return new Response(null, { status: 201 });
 }
 
-async function deletePath(env: Env, path: string): Promise<Response> {
+async function deletePath(env: Env, path: string, request?: Request): Promise<Response> {
   if (!path) return textResponse("The root collection cannot be deleted", 403);
+  if (request) {
+    // 删除属于移除父集合的内部成员，depth-0 集合锁同样生效
+    const lockResponse = await assertUnlocked(env, path, request, true);
+    if (lockResponse) return lockResponse;
+  }
 
   const object = await env.WEBDAV_BUCKET.head(r2Key(path));
   if (object) {
+    if (request) {
+      const preconditionResponse = evaluateMutatingPrecondition(request, object.httpEtag);
+      if (preconditionResponse) return preconditionResponse;
+    }
     // 软删除：移动到回收站
     const trashKey = `${TRASH_PREFIX}${Date.now()}_${path}`;
     const trashMeta = {
@@ -890,6 +1169,9 @@ async function deletePath(env: Env, path: string): Promise<Response> {
 
   // 目录删除
   if (!(await env.WEBDAV_KV.get(dirKey(path))) && !(await hasChildren(env, path))) return textResponse("Not Found", 404);
+  // 目录递归删除：成员上的锁未提交 token 时拒绝（RFC 4918 §7.5.2）
+  const descendantLocks = await findConflictingDescendantLocks(env, path, request);
+  if (descendantLocks.length) return textResponse("Locked descendant resources", 423);
 
   // 软删除目录及其内容
   const objects = await listAllObjects(env, `${path}/`);
@@ -992,7 +1274,17 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
   if (!destination || destination === source || destination.startsWith(`${source}/`)) return textResponse("Invalid destination", 400);
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
   const destinationObject = await env.WEBDAV_BUCKET.head(r2Key(destination));
+  const sourceHead = await env.WEBDAV_BUCKET.head(r2Key(source));
+  const sourceLockResponse = await assertUnlocked(env, source, request, move);
+  if (sourceLockResponse) return sourceLockResponse;
+  const destinationLockResponse = await assertUnlocked(env, destination, request, !destinationObject);
+  if (destinationLockResponse) return destinationLockResponse;
   if (destinationObject && !overwrite) return textResponse("Destination exists", 412);
+  // 条件请求按 RFC 9110 针对 Request-URI（源）评估 If-Match；If-None-Match 结合目标实现"仅创建"语义
+  const ifMatch = request.headers.get("If-Match");
+  if (ifMatch && (!sourceHead || !etagMatches(ifMatch, sourceHead.httpEtag))) return textResponse("Precondition Failed", 412);
+  const ifNoneMatch = request.headers.get("If-None-Match");
+  if (ifNoneMatch && destinationObject && etagMatches(ifNoneMatch, destinationObject.httpEtag)) return textResponse("Precondition Failed", 412);
   if (!move && account && rootEnv) {
     const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, destination, await storageSizeAtPath(env, source));
     if (quotaResponse) return quotaResponse;
@@ -1010,6 +1302,11 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
     return new Response(null, { status: 201 });
   }
   if (!(await hasChildren(env, source)) && !(await env.WEBDAV_KV.get(dirKey(source)))) return textResponse("Not Found", 404);
+  // 目录递归移动：源成员上的锁未提交 token 时拒绝（RFC 4918 §7.5.2）
+  if (move) {
+    const descendantLocks = await findConflictingDescendantLocks(env, source, request);
+    if (descendantLocks.length) return textResponse("Locked descendant resources", 423);
+  }
   const objects = await listAllObjects(env, `${source}/`);
   for (const item of objects) {
     const body = await env.WEBDAV_BUCKET.get(item.key);
@@ -1027,26 +1324,54 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
   return new Response(null, { status: 201 });
 }
 
-async function propfind(request: Request, env: Env, path: string, account?: WebdavAccount): Promise<Response> {
+const SUPPORTEDLOCK_XML = `<d:supportedlock><d:lockentry><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockentry><d:lockentry><d:lockscope><d:shared/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockentry></d:supportedlock>`;
+
+// 请求级预取账户内全部锁，避免 PROPFIND 逐条目遍历 KV
+async function loadLockMap(env: Env): Promise<Map<string, LockInfo[]>> {
+  const map = new Map<string, LockInfo[]>();
+  for (const name of await listAllKV(env, LOCK_PREFIX)) {
+    const lockedPath = decodeURIComponent(name.slice(LOCK_PREFIX.length));
+    const locks = await readLocks(env, lockedPath);
+    if (locks.length) map.set(lockedPath, locks);
+  }
+  return map;
+}
+
+async function propfind(request: Request, env: Env, path: string, account?: WebdavAccount, rootEnv?: Env): Promise<Response> {
   const depth = (request.headers.get("Depth") ?? "infinity").trim().toLowerCase();
   if (depth !== "0" && depth !== "1" && depth !== "infinity") return textResponse("Invalid Depth header", 400);
   const rootObject = path ? await env.WEBDAV_BUCKET.head(r2Key(path)) : null;
   const rootIsDirectory = !rootObject;
   if (path && !rootObject && !(await env.WEBDAV_KV.get(dirKey(path))) && !(await hasChildren(env, path))) return textResponse("Not Found", 404);
+  // RFC 4331 配额属性：仅在集合上返回，同一目录树共享一次计算结果
+  let quotaXml = "";
+  if (rootIsDirectory) {
+    const used = account && rootEnv ? await getUserStorageUsage(rootEnv, account.owner) : await storageSizeAtPath(env, "");
+    const available = Math.max(0, USER_STORAGE_LIMIT - used);
+    quotaXml = `<d:quota-used-bytes>${used}</d:quota-used-bytes><d:quota-available-bytes>${available}</d:quota-available-bytes>`;
+  }
   const entries = [{ path, directory: rootIsDirectory }];
+  const lockMap = await loadLockMap(env);
   if (depth === "1" && rootIsDirectory) entries.push(...await listChildren(env, path));
   if (depth === "infinity" && rootIsDirectory) entries.push(...await listDescendants(env, path));
-  const xml = (await Promise.all(entries.map((entry) => propResponse(request, env, entry.path, entry.directory, account)))).join("");
-  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1", "Cache-Control": "no-store" } });
+  const xml = (await Promise.all(entries.map((entry) => propResponse(request, env, entry.path, entry.directory, account, entry.directory ? quotaXml : "", lockMap)))).join("");
+  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1, 2", "Cache-Control": "no-store" } });
 }
 
-async function propResponse(request: Request, env: Env, path: string, directory: boolean, account?: WebdavAccount): Promise<string> {
+async function propResponse(request: Request, env: Env, path: string, directory: boolean, account?: WebdavAccount, quotaXml = "", lockMap: Map<string, LockInfo[]> = new Map()): Promise<string> {
   const object = directory ? null : await env.WEBDAV_BUCKET.head(r2Key(path));
   const displayName = path ? path.slice(path.lastIndexOf("/") + 1) : "WebDAV";
   const href = `${new URL(request.url).origin}${urlPath(env, path, account)}${directory ? "/" : ""}`;
   const size = object?.size ?? 0;
   const modified = object?.uploaded?.toUTCString() ?? new Date().toUTCString();
-  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+  // lockdiscovery：从预取锁映射中筛出覆盖该资源的锁（精确匹配任意 depth，或 Depth: infinity 祖先）
+  const applicableLocks: LockInfo[] = [];
+  for (const [lockedPath, locks] of lockMap) {
+    if (lockedPath === path) applicableLocks.push(...locks);
+    else if (path.startsWith(`${lockedPath}/`)) applicableLocks.push(...locks.filter((lock) => lock.depth === "infinity"));
+  }
+  const lockXml = applicableLocks.map((lock) => activeLockXml(lock, href)).join("");
+  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}${quotaXml}${SUPPORTEDLOCK_XML}${lockXml ? `<d:lockdiscovery>${lockXml}</d:lockdiscovery>` : ""}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
 }
 
 function urlPath(env: Env, path: string, account?: WebdavAccount): string {
@@ -1328,7 +1653,7 @@ const FILES_CSS = `
 .inverse{color:#dcebe6}.file-actions{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px}.file-actions form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.file-actions input[type=file],.mkdir-form input{padding:11px;border:1px solid #cbd7d3;background:#fff;font:inherit}.secondary-button{padding:12px 18px;border:1px solid #397277;border-radius:2px;background:#fff;color:#285b60;font:inherit;font-weight:800;cursor:pointer}.inline-button{display:inline-block;margin:12px 0 18px}.file-table-wrap{overflow-x:auto;background:rgba(255,255,255,.82);border:1px solid #d7e0dc}.file-table-wrap table{width:100%;border-collapse:collapse;min-width:640px}.file-table-wrap th,.file-table-wrap td{padding:15px 18px;text-align:left;border-bottom:1px solid #e0e7e3}.file-table-wrap th{background:#f2f6f3;color:#60716d;font-size:12px}.file-name{font-weight:700}.file-name a{color:#285b60}.folder-icon,.file-icon{display:inline-block;width:34px;margin-right:8px;color:#a47735;font-size:9px;font-weight:900}.file-icon{color:#51817c}.danger-button{padding:7px 11px;border:1px solid #c76c61;border-radius:2px;background:#fff5f3;color:#a43f35;font:inherit;font-size:12px;cursor:pointer}.empty-state{text-align:center;color:#71807e;padding:36px!important}@media(max-width:720px){.file-actions form{width:100%}.file-actions input[type=file],.mkdir-form input{flex:1;min-width:0}}
 `;
 
-var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.file-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,auto);align-items:stretch;gap:12px}.file-actions form{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:stretch;gap:8px;min-width:0;min-height:44px}.file-actions input[type=file],.mkdir-form input,.file-actions button{height:44px;min-height:44px}.file-actions input[type=file],.mkdir-form input{width:100%;min-width:0;padding:0 12px;line-height:42px}.file-actions input[type=file]::file-selector-button{height:42px;margin-right:10px;padding:0 12px;border:0;border-right:1px solid var(--input-border);background:var(--table-header-bg);color:var(--text-primary);font:inherit}.file-actions button{white-space:nowrap;padding:0 18px}@media(max-width:720px){.file-actions{grid-template-columns:1fr}.file-actions form{width:100%}}`;
+var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.storage-badge{display:flex;flex-direction:column;gap:5px;padding:12px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow);font-size:13px;color:var(--text-secondary);white-space:nowrap}.storage-badge strong{color:var(--text-primary);font-size:15px;letter-spacing:-.02em}@media(max-width:720px){.storage-badge{flex-direction:row;gap:16px}}.file-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,auto);align-items:stretch;gap:12px}.file-actions form{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:stretch;gap:8px;min-width:0;min-height:44px}.file-actions input[type=file],.mkdir-form input,.file-actions button{height:44px;min-height:44px}.file-actions input[type=file],.mkdir-form input{width:100%;min-width:0;padding:0 12px;line-height:42px}.file-actions input[type=file]::file-selector-button{height:42px;margin-right:10px;padding:0 12px;border:0;border-right:1px solid var(--input-border);background:var(--table-header-bg);color:var(--text-primary);font:inherit}.file-actions button{white-space:nowrap;padding:0 18px}@media(max-width:720px){.file-actions{grid-template-columns:1fr}.file-actions form{width:100%}}`;
 var TOPBAR_LAYOUT_CSS = `.topbar-inner{display:flex;align-items:center;justify-content:flex-start;gap:16px}.topbar-inner>.topbar-right,.topbar-inner>div:not(.brand):last-child,.topbar-inner>.text-link{margin-left:auto}.topbar-right{display:flex;align-items:center;justify-content:flex-end;gap:16px;flex-wrap:wrap}.file-actions form{width:100%;overflow:hidden}.file-actions input[type=file]{overflow:hidden;text-overflow:ellipsis}.file-actions button{flex:0 0 auto}@media(max-width:720px){.topbar-right{gap:10px}.file-actions{grid-template-columns:1fr}.file-actions form{width:100%}}`;
 var DARK_TEXT_CSS = `[data-theme="dark"]{--text-primary:#c7d7d3;--text-secondary:#91aaa4;--table-header-text:#a5bcb7;--topbar-text:#c7d7d3}[data-theme="dark"] body,[data-theme="dark"] h1,[data-theme="dark"] h2,[data-theme="dark"] h3,[data-theme="dark"] label,[data-theme="dark"] th,[data-theme="dark"] td{color:var(--text-primary)}[data-theme="dark"] .muted,[data-theme="dark"] .card-meta,[data-theme="dark"] .card-label{color:var(--text-secondary)!important}`;
 var LOGIN_DARK_CSS = `[data-theme="dark"] .login-panel{background:#182b2e;border-color:#345052;color:#c7d7d3}[data-theme="dark"] .login-panel h1,[data-theme="dark"] .login-panel label{color:#c7d7d3}[data-theme="dark"] .login-panel .muted{color:#91aaa4!important}[data-theme="dark"] .login-panel input{background:#122326;border-color:#3a5558;color:#c7d7d3}`;
