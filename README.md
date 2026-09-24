@@ -62,23 +62,34 @@
 | Variable | `DAV_PREFIX` | 留空，或填写例如 `team-files` |
 | Variable | `ENABLE_ACCESS_LOG` | `true` |
 
-如果需要自定义管理员账号，在 **Settings -> Variables and Bindings -> Secrets** 中添加：
+如果需要自定义管理员账号，请按下方「管理员账户初始化与新增」的步骤，在 **Settings -> Variables and Secrets** 中以 **Secret** 类型添加：
 
-| Secret 名称 | 值 |
-| --- | --- |
-| `ADMIN_USERNAME` | 自定义用户名 |
-| `ADMIN_PASSWORD` | 自定义密码 |
-
-`ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 仅用于登录管理界面，不会改变 WebDAV 客户端账号。WebDAV 账号在管理界面中单独配置；如需通过环境变量预设，可使用 `WEBDAV_USERNAME` 和 `WEBDAV_PASSWORD`。
+| Secret 名称 | 值 | 类型勾选 |
+| --- | --- | --- |
+| `ADMIN_USERNAME` | 自定义用户名 | Secret |
+| `ADMIN_PASSWORD` | 至少 8 位的密码 | Secret |
 
 #### 管理员账户初始化与新增
 
-管理员账户必须通过 Cloudflare 控制台创建或配置：
+新增或更换管理员账户必须通过 Cloudflare 控制台配置 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`，具体操作步骤如下（界面以 2026 年新版控制台为准）：
 
-1. 打开 Worker，进入 **Settings -> Variables and Bindings -> Secrets**。
-2. 添加 `ADMIN_USERNAME`，值填写新的管理员账户名；添加 `ADMIN_PASSWORD`，值填写至少 8 位的密码。
-3. 点击 **Save**，然后重新部署 Worker，或在 **Deployments** 中执行 **Redeploy**。
-4. 访问 Worker 根地址，使用刚才配置的管理员账户登录。
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，左侧导航进入 **Workers & Pages**。
+2. 在 **Overview** 列表中点击你的 Worker（例如 `cf-webdav`）。
+3. 进入 **Settings** 标签页，找到 **Variables and Secrets** 区域（旧版控制台名为 **Variables and Bindings**）。
+4. 点击 **Add** 按钮，在弹出的表单中填写第一项：
+   - **Type**：选择 **Secret**（不要选 **Text**——明文 Text 变量在后续执行 `wrangler deploy` 时会被清除，Secret 则永久保留且值加密不可见）；
+   - **Variable name**：填写 `ADMIN_USERNAME`；
+   - **Value**：填写新的管理员账户名。
+5. 点击 **Add variable** 继续在同一个表单中添加第二项：
+   - **Type**：再次选择 **Secret**；
+   - **Variable name**：填写 `ADMIN_PASSWORD`；
+   - **Value**：填写至少 8 位的密码（代码要求密码长度 ≥ 8）。
+6. 点击 **Deploy** 保存并发布。Cloudflare 会自动创建新版本并立即部署，无需手动 Redeploy。
+7. 部署完成后访问 Worker 根地址，使用刚才配置的管理员账户登录。**Secret 的 Value 保存后立即隐藏、无法再次查看**，请务必自行妥善保管。
+
+**修改已有管理员的用户名或密码**：同样进入 **Variables and Secrets**，点击 **Edit**，在列表中修改 `ADMIN_PASSWORD`（或 `ADMIN_USERNAME`）的 **Value** 后点击 **Deploy**。若当前界面不允许直接修改 Secret 值，可点击条目旁的 **X** 删除后按上述步骤重新添加。
+
+`ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 仅用于登录管理界面，不会改变 WebDAV 客户端账号。WebDAV 账号在管理界面中单独配置；如需通过环境变量预设，可使用 `WEBDAV_USERNAME` 和 `WEBDAV_PASSWORD`（同样建议选 Secret 类型）。
 
 首次请求时，Worker 会把这组 Secret 同步为管理员角色。如果 KV 中已有同名用户，该用户会升级为管理员并使用 Secret 中的密码。已有账户会自动迁移：原有的 `admin` 保留管理员角色，其他原“管理员”账户降级为普通用户。管理员登录后可创建、删除用户，删除用户及其名下 WebDAV 账户，但不能为用户新增 WebDAV 账户，也不能查看文件、日志或回收站内容。
 
