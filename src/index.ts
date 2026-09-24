@@ -1274,7 +1274,9 @@ th{background:#f6f8fa;font-weight:600}
 .purge-btn{padding:4px 12px;min-height:40px;display:inline-flex;align-items:center;justify-content:center;background:#c62828;color:white;border:0;border-radius:3px;cursor:pointer;font-size:12px}
 .purge-btn:hover{background:#b71c1c}
 .row-actions{display:flex;gap:8px}
+.trash-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin:20px 0}
 .trash-toolbar .restore-btn{padding:10px 20px;font-size:14px;border-radius:5px}
+.trash-toolbar .empty-btn{margin-top:0}
 .empty-form{margin:20px 0;text-align:center}
 .check-col{width:44px;text-align:center}
 td.check-col{text-align:center}
