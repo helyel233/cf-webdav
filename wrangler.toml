@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2026-09-22"
 workers_dev = true
 
+# 每日定时维护：清理回收站孤儿 R2 对象、重置存储用量缓存
+[triggers]
+crons = ["0 3 * * *"]
+
 # 如果你在 Cloudflare Dashboard 中手动绑定了 KV/R2，部署时不要在本地直接执行 `wrangler deploy`。
 # 该占位值仅用于说明：本地/CI 部署前需要先替换成真实的 KV Namespace ID。
 # 只有在执行 `npm run deploy:setup` 或手动填入真实 ID 后，才可以正常部署。

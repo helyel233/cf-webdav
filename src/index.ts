@@ -47,6 +47,22 @@ const SESSION_TTL = 60 * 60 * 24 * 7;
 const LOG_RETENTION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
 export default {
+  // 定时维护（每日）：清理 KV 已过期但 R2 残留的回收站孤儿对象；重置用量缓存以实际 R2 重建，消除增量更新漂移
+  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const accounts = await getWebdavAccounts(env);
+    const cutoff = Date.now() - TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    for (const account of Object.values(accounts)) {
+      const scopedEnv = createScopedEnv(env, storageScope(account));
+      const expired = (await listAllObjects(scopedEnv, "__trash/")).filter((obj) => {
+        const deletedAt = Date.parse(obj.customMetadata?.deletedAt || "");
+        return Number.isFinite(deletedAt) && deletedAt < cutoff;
+      });
+      for (let index = 0; index < expired.length; index += 1000) {
+        await scopedEnv.WEBDAV_BUCKET.delete(expired.slice(index, index + 1000).map((obj) => obj.key));
+      }
+      for (const key of await listAllKV(scopedEnv, STORAGE_USAGE_KEY)) await scopedEnv.WEBDAV_KV.delete(key);
+    }
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const pathname = new URL(request.url).pathname;
     const clientIp = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
@@ -580,13 +596,18 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         await logOperation("DELETE", "__trash/*");
       } else if (action === "purge") {
         const paths = form.getAll("paths").map(String).filter(Boolean);
-        for (const trashPath of paths) await purgeFromTrash(scopedEnv, trashPath);
-        for (const trashPath of paths) await logOperation("DELETE", trashPath);
+        for (const trashKey of paths) await purgeFromTrash(scopedEnv, trashKey);
+        for (const trashKey of paths) await logOperation("DELETE", decodeTrashKeyName(trashKey));
       } else if (action === "restore") {
         const paths = form.getAll("paths").map(String).filter(Boolean);
         const restoredPaths = paths.length ? paths : [String(form.get("path") || "")].filter(Boolean);
-        for (const trashPath of restoredPaths) await restoreFromTrash(scopedEnv, trashPath);
-        for (const trashPath of restoredPaths) await logOperation("PUT", trashPath);
+        let conflictCount = 0;
+        for (const trashKey of restoredPaths) {
+          const result = await restoreFromTrash(scopedEnv, trashKey, selected, env);
+          if (result.status !== 204) conflictCount++;
+        }
+        for (const trashKey of restoredPaths) await logOperation("PUT", decodeTrashKeyName(trashKey));
+        return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}${conflictCount ? "&warn=conflict" : ""}` } });
       }
       return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
@@ -880,7 +901,7 @@ function requestPath(request: Request, env: Env, account?: WebdavAccount): strin
   const accountPrefix = account ? `${account.owner}/${account.uuid}` : "";
   if (accountPrefix && (relative === accountPrefix || relative.startsWith(`${accountPrefix}/`))) relative = relative.slice(accountPrefix.length).replace(/^\/+/, "");
   const segments = relative ? relative.split("/") : [];
-  if (segments.some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid path");
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash")) throw new Error("invalid path");
   return segments.join("/");
 }
 
@@ -1237,31 +1258,32 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
       const preconditionResponse = evaluateMutatingPrecondition(request, object.httpEtag);
       if (preconditionResponse) return preconditionResponse;
     }
-    // 软删除：移动到回收站
-    const trashKey = `${TRASH_PREFIX}${Date.now()}_${path}`;
+    // 软删除：移动到回收站。KV/R2 统一使用 {时间戳}_{编码路径} 版本键，同名多次删除互不覆盖
+    const deletedAtMs = Date.now();
+    const versionKey = `${TRASH_PREFIX}${deletedAtMs}_${encodeURIComponent(path)}`;
+    const deletedAt = new Date().toISOString();
     const trashMeta = {
       originalPath: path,
-      deletedAt: new Date().toISOString(),
+      deletedAt,
       size: object.size,
       contentType: object.httpMetadata?.contentType,
     };
 
-    // 复制文件到回收站位置（使用特殊前缀）
+    // 复制文件到回收站位置；复制失败必须中断并保留原文件，避免产生无内容的幽灵回收站条目
     const fileContent = await env.WEBDAV_BUCKET.get(r2Key(path));
-    if (fileContent) {
-      await env.WEBDAV_BUCKET.put(`__trash/${trashKey}`, fileContent.body, {
-        httpMetadata: fileContent.httpMetadata,
-        customMetadata: { originalPath: path, deletedAt: trashMeta.deletedAt },
-      });
-    }
+    if (!fileContent) return textResponse("Failed to copy to trash, please retry", 500);
+    await env.WEBDAV_BUCKET.put(`__trash/${versionKey}`, fileContent.body, {
+      httpMetadata: fileContent.httpMetadata,
+      customMetadata: { originalPath: path, deletedAt },
+    });
 
     // 删除原文件
     await env.WEBDAV_BUCKET.delete(r2Key(path));
     await env.WEBDAV_KV.delete(metaKey(path));
     await adjustAccountStorageUsage(env, -object.size);
 
-    // 记录删除信息到 KV（用于管理界面显示）；键中的路径必须编码，避免含 % 等字符时与读取侧 decode 不对称
-    await env.WEBDAV_KV.put(`${TRASH_PREFIX}${encodeURIComponent(path)}`, JSON.stringify(trashMeta), {
+    // 记录删除信息到 KV（用于管理界面显示，30 天过期）
+    await env.WEBDAV_KV.put(versionKey, JSON.stringify(trashMeta), {
       expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60,
     });
 
@@ -1277,20 +1299,21 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
   // 软删除目录及其内容
   const objects = await listAllObjects(env, `${path}/`);
   const removedBytes = objects.reduce((total, item) => total + item.size, 0);
+  const deletedAtMs = Date.now();
   const deletedAt = new Date().toISOString();
+  const versionKey = `${TRASH_PREFIX}${deletedAtMs}_${encodeURIComponent(path)}`;
 
-  // 移动文件到回收站
+  // 移动文件到回收站：子对象统一使用目录条目的同一时间戳，恢复/清理时按键前缀精确匹配本批次版本；
+  // 单个对象复制失败则整体中断（未删除部分可重试），避免幽灵条目与用量错账
   for (let index = 0; index < objects.length; index += 1000) {
     const batch = objects.slice(index, index + 1000);
     for (const item of batch) {
-      const trashKey = `${TRASH_PREFIX}${Date.now()}_${item.key}`;
       const fileContent = await env.WEBDAV_BUCKET.get(item.key);
-      if (fileContent) {
-        await env.WEBDAV_BUCKET.put(`__trash/${trashKey}`, fileContent.body, {
-          httpMetadata: fileContent.httpMetadata,
-          customMetadata: { originalPath: item.key, deletedAt },
-        });
-      }
+      if (!fileContent) return textResponse("Failed to copy to trash, please retry", 500);
+      await env.WEBDAV_BUCKET.put(`__trash/${TRASH_PREFIX}${deletedAtMs}_${encodeURIComponent(item.key)}`, fileContent.body, {
+        httpMetadata: fileContent.httpMetadata,
+        customMetadata: { originalPath: item.key, deletedAt },
+      });
       await env.WEBDAV_BUCKET.delete(item.key);
     }
   }
@@ -1299,7 +1322,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
   await deleteMetadataUnder(env, path);
 
   // 记录目录删除信息
-  await env.WEBDAV_KV.put(`${TRASH_PREFIX}${encodeURIComponent(path)}`, JSON.stringify({
+  await env.WEBDAV_KV.put(versionKey, JSON.stringify({
     originalPath: path,
     deletedAt,
     isDirectory: true,
@@ -1310,9 +1333,9 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
   return new Response(null, { status: 204 });
 }
 
-// 解码回收站 KV 键中的路径：新数据写入时已编码；旧数据未编码，含 % 时 decode 会抛错，需容错回退原样
-function decodeTrashKeyName(keyName: string): string {
-  const encoded = keyName.slice(TRASH_PREFIX.length);
+// 解码回收站键名中的路径：新格式为 {13 位时间戳}_{编码路径}；旧格式为未编码原始路径，需容错
+function decodeTrashKeyName(keySuffix: string): string {
+  const encoded = /^(\d{13})_(.+)$/.exec(keySuffix)?.[2] ?? keySuffix;
   try {
     return decodeURIComponent(encoded);
   } catch {
@@ -1320,55 +1343,101 @@ function decodeTrashKeyName(keyName: string): string {
   }
 }
 
-// 新增：恢复回收站文件
-async function restoreFromTrash(env: Env, trashPath: string): Promise<Response> {
-  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`, "json") as { originalPath: string; deletedAt: string } | null;
-  if (!trashMeta) return textResponse("Not Found in Trash", 404);
+// 按 KV 版本键收集回收站 R2 对象（新格式：文件精确匹配、目录按版本前缀匹配本批次；旧格式回退按 originalPath 扫描）
+async function collectTrashObjects(env: Env, trashKey: string, meta: { originalPath: string; isDirectory?: boolean }): Promise<R2Object[]> {
+  const versionPrefix = `__trash/${TRASH_PREFIX}${trashKey}`;
+  const matched = meta.isDirectory
+    ? (await listAllObjects(env, versionPrefix)).filter((obj) => obj.key === versionPrefix || obj.key.startsWith(`${versionPrefix}/`))
+    : (await listAllObjects(env, versionPrefix)).filter((obj) => obj.key === versionPrefix);
+  if (matched.length) return matched;
+  return (await listAllObjects(env, `__trash/${TRASH_PREFIX}`)).filter((obj) => {
+    const originalPath = obj.customMetadata?.originalPath;
+    return originalPath === meta.originalPath || originalPath?.startsWith(`${meta.originalPath}/`);
+  });
+}
 
-  // 恢复文件
-  const trashObjects = await listAllObjects(env, `__trash/${TRASH_PREFIX}`);
-  let restoredBytes = 0;
-  for (const obj of trashObjects) {
-    const customMeta = obj.customMetadata;
-    if (customMeta?.originalPath === trashMeta.originalPath || customMeta?.originalPath?.startsWith(`${trashMeta.originalPath}/`)) {
-      const content = await env.WEBDAV_BUCKET.get(obj.key);
-      if (content) {
-        await env.WEBDAV_BUCKET.put(customMeta.originalPath, content.body, {
-          httpMetadata: content.httpMetadata,
-        });
-        restoredBytes += content.size;
-      }
-      await env.WEBDAV_BUCKET.delete(obj.key);
+// 恢复文件后重建父目录的 dir: 标记（空目录条目也需重建自身，否则 PROPFIND 中不可见）
+async function ensureDirectoryMarkers(env: Env, entries: string[]): Promise<void> {
+  const dirs = new Set<string>();
+  for (const entry of entries) {
+    const segments = entry.split("/");
+    segments.pop();
+    let current = "";
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      dirs.add(current);
     }
   }
-  // 回收站对象不计入用量，恢复后重新计入
-  await adjustAccountStorageUsage(env, restoredBytes);
+  for (const dir of dirs) {
+    if (!(await env.WEBDAV_KV.get(dirKey(dir)))) await env.WEBDAV_KV.put(dirKey(dir), new Date().toISOString());
+  }
+}
 
-  // 删除回收站记录
-  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`);
+// 从回收站恢复（trashKey 为 KV 键去掉 TRASH_PREFIX 的版本后缀）。
+// 目标路径已存在同名文件时跳过该对象（覆盖即不可逆丢失）；全部冲突时返回 409 且保留回收站条目以便重试。
+async function restoreFromTrash(env: Env, trashKey: string, account?: WebdavAccount, rootEnv?: Env): Promise<Response> {
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashKey}`, "json") as { originalPath: string; deletedAt: string; isDirectory?: boolean } | null;
+  if (!trashMeta) return textResponse("Not Found in Trash", 404);
+
+  const trashObjects = await collectTrashObjects(env, trashKey, trashMeta);
+
+  // 恢复前做配额校验（回收站对象不计入用量，恢复将重新计入）
+  const plannedBytes = trashObjects.reduce((total, obj) => total + obj.size, 0);
+  if (account && rootEnv) {
+    const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, trashMeta.originalPath, plannedBytes);
+    if (quotaResponse) return quotaResponse;
+  }
+
+  const restoredEntries: string[] = trashMeta.isDirectory ? [trashMeta.originalPath] : [];
+  let restoredBytes = 0;
+  let conflicts = 0;
+  for (const obj of trashObjects) {
+    const originalPath = obj.customMetadata?.originalPath;
+    if (!originalPath) {
+      await env.WEBDAV_BUCKET.delete(obj.key);
+      continue;
+    }
+    if (await env.WEBDAV_BUCKET.head(r2Key(originalPath))) {
+      conflicts++;
+      continue;
+    }
+    const content = await env.WEBDAV_BUCKET.get(obj.key);
+    if (content) {
+      await env.WEBDAV_BUCKET.put(originalPath, content.body, {
+        httpMetadata: content.httpMetadata,
+      });
+      restoredBytes += content.size;
+    }
+    restoredEntries.push(originalPath);
+    await env.WEBDAV_BUCKET.delete(obj.key);
+  }
+  if (conflicts && !restoredBytes) return textResponse("恢复冲突：目标路径已存在同名文件，已跳过", 409);
+
+  // 回收站对象不计入用量，恢复后重新计入
+  if (restoredBytes) await adjustAccountStorageUsage(env, restoredBytes);
+  await ensureDirectoryMarkers(env, restoredEntries);
+
+  // 部分冲突时保留回收站条目，剩余对象可重试恢复
+  if (!conflicts) await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashKey}`);
 
   return new Response(null, { status: 204 });
 }
 
-// 新增：从回收站永久删除（单个条目，含目录下的全部对象）
-async function purgeFromTrash(env: Env, trashPath: string): Promise<void> {
-  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`, "json") as { originalPath: string; deletedAt: string } | null;
+// 从回收站永久删除（trashKey 为 KV 键去掉 TRASH_PREFIX 的版本后缀；目录含子树对象）
+async function purgeFromTrash(env: Env, trashKey: string): Promise<void> {
+  const trashMeta = await env.WEBDAV_KV.get(`${TRASH_PREFIX}${trashKey}`, "json") as { originalPath: string; deletedAt: string; isDirectory?: boolean } | null;
   if (!trashMeta) return;
 
-  // 删除 __trash/ 下对应的对象（含子目录内容）
-  const trashObjects = await listAllObjects(env, `__trash/${TRASH_PREFIX}`);
-  for (const obj of trashObjects) {
-    const customMeta = obj.customMetadata;
-    if (customMeta?.originalPath === trashMeta.originalPath || customMeta?.originalPath?.startsWith(`${trashMeta.originalPath}/`)) {
-      await env.WEBDAV_BUCKET.delete(obj.key);
-    }
+  const trashObjects = await collectTrashObjects(env, trashKey, trashMeta);
+  for (let index = 0; index < trashObjects.length; index += 1000) {
+    await env.WEBDAV_BUCKET.delete(trashObjects.slice(index, index + 1000).map((obj) => obj.key));
   }
 
   // 删除回收站元数据
-  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${encodeURIComponent(trashPath)}`);
+  await env.WEBDAV_KV.delete(`${TRASH_PREFIX}${trashKey}`);
 }
 
-// 新增：清空回收站
+// 新增：清空回收站（两阶段删除与并发写存在理论竞态，残留漂移由定时任务按实际 R2 重算用量兼底）
 async function emptyTrash(env: Env): Promise<Response> {
   const trashObjects = await listAllObjects(env, "__trash/");
   for (let index = 0; index < trashObjects.length; index += 1000) {
@@ -1740,16 +1809,16 @@ a:hover{text-decoration:underline}
 `;
 
 // 新增：回收站管理页面
-async function adminTrashPage(env: Env, accountUsername: string): Promise<Response> {
-  const trashItems: Array<{ path: string; originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean }> = [];
+async function adminTrashPage(env: Env, accountUsername: string, warn = ""): Promise<Response> {
+  const trashItems: Array<{ key: string; originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean }> = [];
   let cursor: string | undefined;
   do {
     const page = await env.WEBDAV_KV.list({ prefix: TRASH_PREFIX, cursor, limit: 100 });
     for (const key of page.keys) {
       const meta = await env.WEBDAV_KV.get(key.name, "json") as { originalPath: string; deletedAt: string; size?: number; isDirectory?: boolean } | null;
       if (meta) {
-        const path = decodeTrashKeyName(key.name);
-        trashItems.push({ path, ...meta });
+        // 表单操作传回完整键后缀（含时间戳版本），避免旧格式数据解码后无法定位原键
+        trashItems.push({ key: key.name.slice(TRASH_PREFIX.length), ...meta });
       }
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -1762,14 +1831,15 @@ async function adminTrashPage(env: Env, accountUsername: string): Promise<Respon
     const path = escapeXml(item.originalPath);
     const type = item.isDirectory ? "目录" : "文件";
     const size = item.size ? formatBytes(item.size) : "-";
-    return `<tr><td class="check-col"><input type="checkbox" class="trash-check" form="trash-toolbar-form" name="paths" value="${escapeXml(item.path)}"></td><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><div class="row-actions"><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.path)}"><button type="submit" class="restore-btn">恢复</button></form><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" onsubmit="return confirm('确定要永久删除此项吗？此操作不可恢复！')"><input type="hidden" name="action" value="purge"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="paths" value="${escapeXml(item.path)}"><button type="submit" class="purge-btn">永久删除</button></form></div></td></tr>`;
+    return `<tr><td class="check-col"><input type="checkbox" class="trash-check" form="trash-toolbar-form" name="paths" value="${escapeXml(item.key)}"></td><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><div class="row-actions"><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.key)}"><button type="submit" class="restore-btn">恢复</button></form><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" onsubmit="return confirm('确定 要永久删除此项吗？此操作不可恢复！')"><input type="hidden" name="action" value="purge"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="paths" value="${escapeXml(item.key)}"><button type="submit" class="purge-btn">永久删除</button></form></div></td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${FILES_CSS}${TRASH_CSS}</style><body>${topbarHtml("回收站", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a>`)}<main class="dashboard">${pageHeadingHtml("TRASH", "回收站", `账户：${accountUsername}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理`, `<a class="secondary-button" href="/?view=files&account=${encodeURIComponent(accountUsername)}">回到文件管理</a>`)}<section class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-col"><input type="checkbox" id="trash-select-all" onchange="toggleTrashSelect(this.checked)" title="全选" aria-label="全选"></th><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="6">回收站为空</td></tr>'}</tbody></table></section>${trashItems.length > 0 ? `<form id="trash-toolbar-form" method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="trash-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" name="action" value="restore" class="restore-btn" onclick="return confirmTrashRestore()">恢复选中</button><button type="submit" name="action" value="purge" class="empty-btn" onclick="return confirmTrashPurge()">永久删除选中</button><button type="submit" name="action" value="empty" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form><script>function toggleTrashSelect(checked){document.querySelectorAll('.trash-check').forEach(function(c){c.checked=checked});}function confirmTrashPurge(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要操作的文件');return false;}return confirm('确定要永久删除选中的 '+n+' 项吗？此操作不可恢复！');}function confirmTrashRestore(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要恢复的文件');return false;}return confirm('确定要恢复选中的 '+n+' 项吗？');}</script>` : ""}</main></body></html>`);
+  const warnBanner = warn === "conflict" ? `<div class="trash-warn">部分条目未能恢复：目标路径已存在同名文件，已跳过；对应条目已保留在回收站</div>` : "";
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${FILES_CSS}${TRASH_CSS}</style><body>${topbarHtml("回收站", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a>`)}<main class="dashboard">${warnBanner}${pageHeadingHtml("TRASH", "回收站", `账户：${accountUsername}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理`, `<a class="secondary-button" href="/?view=files&account=${encodeURIComponent(accountUsername)}">回到文件管理</a>`)}<section class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-col"><input type="checkbox" id="trash-select-all" onchange="toggleTrashSelect(this.checked)" title="全选" aria-label="全选"></th><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="6">回收站为空</td></tr>'}</tbody></table></section>${trashItems.length > 0 ? `<form id="trash-toolbar-form" method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="trash-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" name="action" value="restore" class="restore-btn" onclick="return confirmTrashRestore()">恢复选中</button><button type="submit" name="action" value="purge" class="empty-btn" onclick="return confirmTrashPurge()">永久删除选中</button><button type="submit" name="action" value="empty" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form><script>function toggleTrashSelect(checked){document.querySelectorAll('.trash-check').forEach(function(c){c.checked=checked});}function confirmTrashPurge(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要操作的文件');return false;}return confirm('确定要永久删除选中的 '+n+' 项吗？此操作不可恢复！');}function confirmTrashRestore(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要恢复的文件');return false;}return confirm('确定要恢复选中的 '+n+' 项吗？');}</script>` : ""}</main></body></html>`);
 }
 
 const TRASH_CSS = `
-table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14px}
+.trash-warn{margin:16px 0;padding:10px 14px;border:1px solid #f0c36d;background:#fdf6e3;color:#8a6d3b;border-radius:6px;font-size:14px}table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e1e4e8}
 th{background:#f6f8fa;font-weight:600}
 .restore-btn{padding:4px 12px;background:#2e7d32;color:white;border:0;border-radius:3px;cursor:pointer;font-size:12px}
