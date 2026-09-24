@@ -89,11 +89,11 @@ export default {
         case "PROPFIND": response = await propfind(request, scopedEnv, path, webdavAccount); break;
         case "GET": response = await getObject(scopedEnv, path, false, request); break;
         case "HEAD": response = await getObject(scopedEnv, path, true, request); break;
-        case "PUT": response = await putObject(request, scopedEnv, path); break;
+        case "PUT": response = await putObject(request, scopedEnv, path, webdavAccount, env); break;
         case "DELETE": response = await deletePath(scopedEnv, path); break;
         case "MKCOL": response = await makeCollection(scopedEnv, path); break;
-        case "COPY": response = await copyOrMove(request, scopedEnv, path, false, webdavAccount); break;
-        case "MOVE": response = await copyOrMove(request, scopedEnv, path, true, webdavAccount); break;
+        case "COPY": response = await copyOrMove(request, scopedEnv, path, false, webdavAccount, env); break;
+        case "MOVE": response = await copyOrMove(request, scopedEnv, path, true, webdavAccount, env); break;
         default:
           response = textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
       }
@@ -468,7 +468,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
-      return adminFilesAction(request, createScopedEnv(env, storageScope(selected)), form, sessionUser_, selected.username);
+      return adminFilesAction(request, env, form, sessionUser_, selected.username, selected);
     }
     if (view === "trash" && ["restore", "empty"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
@@ -609,7 +609,8 @@ function adminPath(value: string): string {
   return path;
 }
 
-async function adminFilesAction(request: Request, env: Env, form: FormData, username: string, accountUsername: string): Promise<Response> {
+async function adminFilesAction(request: Request, env: Env, form: FormData, username: string, accountUsername: string, account: WebdavAccount): Promise<Response> {
+  const scopedEnv = createScopedEnv(env, storageScope(account));
   const action = String(form.get("action") || "");
   const currentPath = adminPath(String(form.get("currentPath") || ""));
   let operationPath = currentPath;
@@ -622,18 +623,20 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       const path = adminPath(`${currentPath ? `${currentPath}/` : ""}${file.name}`);
       operationPath = path;
       operationMethod = "PUT";
-      await env.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
-      await env.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
+      const quotaResponse = await ensureStorageCapacity(env, scopedEnv, account, path, file.size);
+      if (quotaResponse) return quotaResponse;
+      await scopedEnv.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
+      await scopedEnv.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
     } else if (action === "mkdir") {
       const name = String(form.get("name") || "");
       operationPath = adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`);
       operationMethod = "MKCOL";
-      const response = await makeCollection(env, operationPath);
+      const response = await makeCollection(scopedEnv, operationPath);
       responseStatus = response.status;
     } else if (action === "delete") {
       operationPath = adminPath(String(form.get("path") || ""));
       operationMethod = "DELETE";
-      const response = await deletePath(env, operationPath);
+      const response = await deletePath(scopedEnv, operationPath);
       responseStatus = response.status;
     }
   } catch (error) {
@@ -703,7 +706,7 @@ function htmlResponse(body: string): Response {
   const accountFileLink = withLogout.match(/<a class="secondary-button inline-button" href="\/\?view=files&account=([^"]+)">打开此账户文件<\/a>/);
   const withAccountTools = accountFileLink ? withLogout.replace(accountFileLink[0], `${accountFileLink[0]}<a class="secondary-button inline-button" href="/?view=logs&account=${accountFileLink[1]}">访问日志</a><a class="secondary-button inline-button" href="/?view=trash&account=${accountFileLink[1]}">回收站</a><form method="post" action="/?view=account" class="inline-button" onsubmit="return confirm('确定要删除此 WebDAV 账户及其全部文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-webdav"><input type="hidden" name="accountUsername" value="${escapeHtml(decodeURIComponent(accountFileLink[1]))}"><button class="danger-button" type="submit">删除整个账户</button></form>`) : withLogout;
   // 注入 UI_POLISH_CSS 和 DARK_MODE_CSS
-  let polishedBody = withAccountTools.replace("</style>", `${UI_POLISH_CSS}${DARK_MODE_CSS}${TABLE_POLISH_CSS}</style>`);
+  let polishedBody = withAccountTools.replace("</style>", `${UI_POLISH_CSS}${DARK_MODE_CSS}${TABLE_POLISH_CSS}${FORM_LAYOUT_CSS}</style>`);
   // 在 topbar 或 login-shell 中注入暗黑模式切换按钮
   const themeToggle = '<button class="theme-toggle" onclick="toggleTheme()" title="\u5207\u6362\u660e\u6697\u6a21\u5f0f">\u{1F319}</button>';
   if (polishedBody.includes('</div></header>')) {
@@ -785,8 +788,12 @@ async function getObject(env: Env, path: string, head: boolean, request: Request
   return new Response(head ? null : object.body, { status, headers });
 }
 
-async function putObject(request: Request, env: Env, path: string): Promise<Response> {
+async function putObject(request: Request, env: Env, path: string, account: WebdavAccount, rootEnv: Env): Promise<Response> {
   if (!path) return textResponse("A file path is required", 400);
+  const contentLength = Number(request.headers.get("Content-Length"));
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0) return textResponse("Content-Length is required", 411);
+  const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, path, contentLength);
+  if (quotaResponse) return quotaResponse;
   const contentType = request.headers.get("Content-Type") ?? "application/octet-stream";
   const object = await env.WEBDAV_BUCKET.put(r2Key(path), request.body, { httpMetadata: { contentType } });
   const metadata: FileMeta = { type: "file", size: object.size, etag: object.httpEtag, contentType, updatedAt: new Date().toISOString() };
@@ -916,13 +923,17 @@ async function emptyTrash(env: Env): Promise<Response> {
   return new Response(null, { status: 204 });
 }
 
-async function copyOrMove(request: Request, env: Env, source: string, move: boolean, account?: WebdavAccount): Promise<Response> {
+async function copyOrMove(request: Request, env: Env, source: string, move: boolean, account?: WebdavAccount, rootEnv?: Env): Promise<Response> {
   if (!source) return textResponse("The root collection cannot be moved", 403);
   const destination = destinationPath(request, env, account);
   if (!destination || destination === source || destination.startsWith(`${source}/`)) return textResponse("Invalid destination", 400);
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
   const destinationObject = await env.WEBDAV_BUCKET.head(r2Key(destination));
   if (destinationObject && !overwrite) return textResponse("Destination exists", 412);
+  if (!move && account && rootEnv) {
+    const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, destination, await storageSizeAtPath(env, source));
+    if (quotaResponse) return quotaResponse;
+  }
   if (destinationObject) await env.WEBDAV_BUCKET.delete(r2Key(destination));
   const sourceObject = await env.WEBDAV_BUCKET.get(r2Key(source));
   if (sourceObject) {
@@ -1017,6 +1028,36 @@ async function listAllObjects(env: Env, prefix: string): Promise<R2Object[]> {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return result;
+}
+
+const USER_STORAGE_LIMIT = 10 * 1024 * 1024 * 1024;
+
+async function storageSizeAtPath(env: Env, path: string): Promise<number> {
+  const object = await env.WEBDAV_BUCKET.head(r2Key(path));
+  if (object) return object.size;
+  const objects = await listAllObjects(env, `${path}/`);
+  return objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
+}
+
+async function getUserStorageUsage(env: Env, owner: string): Promise<number> {
+  const accounts = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === owner);
+  const sizes = await Promise.all(accounts.map(async (account) => {
+    const scopedEnv = createScopedEnv(env, storageScope(account));
+    const objects = await listAllObjects(scopedEnv, "");
+    return objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
+  }));
+  return sizes.reduce((total, size) => total + size, 0);
+}
+
+async function ensureStorageCapacity(rootEnv: Env, accountEnv: Env, account: WebdavAccount, path: string, incomingSize: number): Promise<Response | null> {
+  const currentObject = await accountEnv.WEBDAV_BUCKET.head(r2Key(path));
+  const currentUsage = await getUserStorageUsage(rootEnv, account.owner);
+  const projectedUsage = currentUsage - (currentObject?.size || 0) + incomingSize;
+  if (projectedUsage <= USER_STORAGE_LIMIT) return null;
+  return textResponse("用户所有 WebDAV 账户的文件总量不能超过 10 GB", 413, {
+    "X-Storage-Limit": String(USER_STORAGE_LIMIT),
+    "X-Storage-Used": String(currentUsage),
+  });
 }
 
 async function listAllKV(env: Env, prefix: string): Promise<string[]> {
@@ -1207,12 +1248,14 @@ th{background:#f6f8fa;font-weight:600}
 a{color:#1769aa;text-decoration:none}
 a:hover{text-decoration:underline}
 `;
+var DARK_MODE_CSS = `:root{--bg-gradient:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%);--text-primary:#17212b;--text-secondary:#667578;--card-bg:rgba(255,255,255,.82);--card-border:#d7e0dc;--card-shadow:0 12px 30px rgba(31,61,57,.06);--input-bg:#fbfcfa;--input-border:#cbd7d3;--topbar-bg:#183b3f;--topbar-text:#f4f8f5;--table-header-bg:#f2f6f3;--table-header-text:#60716d;--table-border:#e0e7e3;--accent-gold:#d79b41;--accent-gold-hover:#e5ae59;--accent-gold-text:#183b3f;--accent-teal:#397277;--danger-bg:#fff5f3;--danger-border:#c76c61;--danger-text:#a43f35;--secondary-bg:#fff;--secondary-border:#397277;--secondary-text:#285b60;--link-color:#32656a}[data-theme="dark"]{--bg-gradient:linear-gradient(135deg,#0f1a1c 0%,#162628 100%);--text-primary:#e2ecea;--text-secondary:#8fa9a3;--card-bg:rgba(28,46,49,.82);--card-border:#2d484b;--card-shadow:0 12px 30px rgba(0,0,0,.25);--input-bg:#1a2e31;--input-border:#3a5558;--topbar-bg:#0c1618;--topbar-text:#e2ecea;--table-header-bg:#1a2e31;--table-header-text:#8fa9a3;--table-border:#2d484b;--accent-gold:#e5ae59;--accent-gold-hover:#f0be70;--accent-gold-text:#0f1a1c;--accent-teal:#7ab8b0;--danger-bg:#2a1515;--danger-border:#a43f35;--danger-text:#e88078;--secondary-bg:transparent;--secondary-border:#5a9a9e;--secondary-text:#8fd4d8;--link-color:#7ab8b0}body{background:var(--bg-gradient);color:var(--text-primary)}.muted{color:var(--text-secondary)!important}.topbar{background:var(--topbar-bg);color:var(--topbar-text)}.topbar .text-link,.inverse{color:var(--topbar-text)}.summary-card,.config-card,.file-table-wrap,.data-table-wrap{background:var(--card-bg);border-color:var(--card-border);box-shadow:var(--card-shadow)}.config-form input,.filter-label input,.table-form input,.file-actions input,.mkdir-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.primary-button{background:var(--accent-gold);color:var(--accent-gold-text)}.primary-button:hover{background:var(--accent-gold-hover)}.secondary-button{background:var(--secondary-bg);border-color:var(--secondary-border);color:var(--secondary-text)}.danger-button{background:var(--danger-bg);border-color:var(--danger-border);color:var(--danger-text)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text)}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{border-bottom-color:var(--table-border)}th,td{color:var(--text-primary)}.text-link{color:var(--link-color)}.method.GET{background:#152535;color:#6ab0e8}.method.PUT{background:#2a2015;color:#e8a555}.method.DELETE{background:#2a1515;color:#e88078}.method.MKCOL{background:#152a22;color:#5ec98f}.status.success{background:#152a22;color:#5ec98f}.status.warn{background:#2a2015;color:#e8a555}.status.error{background:#2a1515;color:#e88078}.restore-btn{background:#5ec98f;color:#fff}.empty-btn{background:var(--danger-text)}`;
 var TABLE_POLISH_CSS = `.data-table-wrap{overflow-x:auto;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow)}.data-table,.user-table,.file-table-wrap table{width:100%;border-collapse:collapse}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{padding:14px 16px;text-align:left;vertical-align:middle;border-bottom:1px solid var(--table-border)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text);font-size:12px;font-weight:800;letter-spacing:.04em}.data-table tbody tr:last-child td,.user-table tbody tr:last-child td,.file-table-wrap tbody tr:last-child td{border-bottom:0}.data-table .path{max-width:320px}.primary-button,.secondary-button,.danger-button,.restore-btn,.empty-btn{min-height:40px;display:inline-flex;align-items:center;justify-content:center;line-height:1.2}.data-table form{margin:0}.method,.status{display:inline-flex;align-items:center;min-height:26px;padding:3px 8px}.empty-form{display:flex;justify-content:flex-end;gap:10px}.empty-btn{margin-top:18px}`;
 const FILES_CSS = `
 .inverse{color:#dcebe6}.file-actions{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px}.file-actions form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.file-actions input[type=file],.mkdir-form input{padding:11px;border:1px solid #cbd7d3;background:#fff;font:inherit}.secondary-button{padding:12px 18px;border:1px solid #397277;border-radius:2px;background:#fff;color:#285b60;font:inherit;font-weight:800;cursor:pointer}.inline-button{display:inline-block;margin:12px 0 18px}.file-table-wrap{overflow-x:auto;background:rgba(255,255,255,.82);border:1px solid #d7e0dc}.file-table-wrap table{width:100%;border-collapse:collapse;min-width:640px}.file-table-wrap th,.file-table-wrap td{padding:15px 18px;text-align:left;border-bottom:1px solid #e0e7e3}.file-table-wrap th{background:#f2f6f3;color:#60716d;font-size:12px}.file-name{font-weight:700}.file-name a{color:#285b60}.folder-icon,.file-icon{display:inline-block;width:34px;margin-right:8px;color:#a47735;font-size:9px;font-weight:900}.file-icon{color:#51817c}.danger-button{padding:7px 11px;border:1px solid #c76c61;border-radius:2px;background:#fff5f3;color:#a43f35;font:inherit;font-size:12px;cursor:pointer}.empty-state{text-align:center;color:#71807e;padding:36px!important}@media(max-width:720px){.file-actions form{width:100%}.file-actions input[type=file],.mkdir-form input{flex:1;min-width:0}}
 `;
 
-var DARK_MODE_CSS = `:root{--bg-primary:#eef2f1;--bg-gradient:linear-gradient(135deg,#f6f8f5 0%,#e8efed 100%);--text-primary:#17212b;--text-secondary:#667578;--text-muted:#71807e;--card-bg:rgba(255,255,255,.82);--card-border:#d7e0dc;--card-shadow:0 12px 30px rgba(31,61,57,.06);--input-bg:#fbfcfa;--input-border:#cbd7d3;--topbar-bg:#183b3f;--topbar-text:#f4f8f5;--accent-gold:#d79b41;--accent-gold-hover:#e5ae59;--accent-gold-text:#183b3f;--accent-teal:#397277;--accent-teal-text:#285b60;--eyebrow-color:#8a6940;--icon-badge-bg:#eef3ee;--table-header-bg:#f2f6f3;--table-header-text:#60716d;--table-border:#e0e7e3;--notice-bg:#e7f4eb;--notice-border:#3d9368;--notice-text:#176b48;--error-bg:#fff0ee;--error-text:#a43f35;--info-strip-bg:#e7f0eb;--info-strip-text:#45625d;--tool-border:#e0e7e3;--status-dot-color:#c4e3cf;--status-dot-bg:#6bc58d;--danger-border:#c76c61;--danger-bg:#fff5f3;--danger-text:#a43f35;--secondary-border:#397277;--secondary-text:#285b60;--secondary-bg:#fff;--file-icon-color:#51817c;--folder-icon-color:#a47735;--login-panel-bg:rgba(255,255,255,.96);--login-panel-border:rgba(255,255,255,.8);--method-get-bg:#e3f2fd;--method-get-text:#1565c0;--method-put-bg:#fff3e0;--method-put-text:#e65100;--method-delete-bg:#ffebee;--method-delete-text:#c62828;--method-mkcol-bg:#e8f5e9;--method-mkcol-text:#2e7d32;--status-success-bg:#e8f5e9;--status-success-text:#2e7d32;--status-warn-bg:#fff3e0;--status-warn-text:#e65100;--status-error-bg:#ffebee;--status-error-text:#c62828;--link-color:#32656a;--topbar-link-color:#dcebe6}[data-theme="dark"]{--bg-primary:#0f1a1c;--bg-gradient:linear-gradient(135deg,#0f1a1c 0%,#162628 100%);--text-primary:#e2ecea;--text-secondary:#8fa9a3;--text-muted:#7a9590;--card-bg:rgba(28,46,49,.82);--card-border:#2d484b;--card-shadow:0 12px 30px rgba(0,0,0,.25);--input-bg:#1a2e31;--input-border:#3a5558;--topbar-bg:#0c1618;--topbar-text:#e2ecea;--accent-gold:#e5ae59;--accent-gold-hover:#f0be70;--accent-gold-text:#0f1a1c;--eyebrow-color:#c9a265;--icon-badge-bg:#1a2e31;--table-header-bg:#1a2e31;--table-header-text:#8fa9a3;--table-border:#2d484b;--notice-bg:#152a22;--notice-border:#3d9368;--notice-text:#5ec98f;--error-bg:#2a1515;--error-text:#e88078;--info-strip-bg:#152a25;--info-strip-text:#8fc5b5;--tool-border:#2d484b;--status-dot-color:#8fd4a8;--status-dot-bg:#3d9368;--danger-border:#a43f35;--danger-bg:#2a1515;--danger-text:#e88078;--secondary-border:#5a9a9e;--secondary-text:#8fd4d8;--secondary-bg:transparent;--file-icon-color:#7ab8b0;--folder-icon-color:#c9a265;--login-panel-bg:rgba(20,36,38,.96);--login-panel-border:rgba(45,72,75,.8);--method-get-bg:#152535;--method-get-text:#6ab0e8;--method-put-bg:#2a2015;--method-put-text:#e8a555;--method-delete-bg:#2a1515;--method-delete-text:#e88078;--method-mkcol-bg:#152a22;--method-mkcol-text:#5ec98f;--status-success-bg:#152a22;--status-success-text:#5ec98f;--status-warn-bg:#2a2015;--status-warn-text:#e8a555;--status-error-bg:#2a1515;--status-error-text:#e88078;--link-color:#7ab8b0;--topbar-link-color:#c5ddd6}body{background:var(--bg-gradient);color:var(--text-primary)}.muted{color:var(--text-secondary)!important}.eyebrow{color:var(--eyebrow-color)!important}.topbar{background:var(--topbar-bg);color:var(--topbar-text);position:relative;z-index:100}.topbar-inner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-right:56px}.brand{display:flex;align-items:center;gap:12px}.topbar-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.status-dot{color:var(--status-dot-color)}.status-dot:before{background:var(--status-dot-bg)}.text-link{color:var(--link-color)}.topbar .text-link{color:var(--topbar-link-color)}.summary-card,.config-card{background:var(--card-bg);border-color:var(--card-border);box-shadow:var(--card-shadow)}.card-label{color:var(--text-muted)}.card-meta{color:var(--text-muted)}.icon-badge{background:var(--icon-badge-bg);color:var(--eyebrow-color)}.card-heading h2{color:var(--text-primary)}.config-form label{color:var(--text-primary)}.config-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.config-form input:focus{border-color:var(--accent-teal);box-shadow:0 0 0 3px rgba(76,133,129,.25)}.primary-button{background:var(--accent-gold);color:var(--accent-gold-text)}.primary-button:hover{background:var(--accent-gold-hover)}.secondary-button{background:var(--secondary-bg);border-color:var(--secondary-border);color:var(--secondary-text)}.danger-button{background:var(--danger-bg);border-color:var(--danger-border);color:var(--danger-text)}.tool-list{border-top-color:var(--tool-border)}.tool-row{border-bottom-color:var(--tool-border)}.tool-row small{color:var(--text-muted)}.arrow{color:var(--accent-teal)}.info-strip{background:var(--info-strip-bg);color:var(--info-strip-text)}.info-icon{border-color:var(--accent-teal)}.notice{background:var(--notice-bg);border-left-color:var(--notice-border)}.success{color:var(--notice-text)!important}.error{background:var(--error-bg);color:var(--error-text)}.login-panel{background:var(--login-panel-bg);border-color:var(--login-panel-border)}.login-panel h1{color:var(--text-primary)}.login-panel label{color:var(--text-primary)}.login-panel input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.file-table-wrap{background:var(--card-bg);border-color:var(--card-border)}.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text)}.file-table-wrap th,.file-table-wrap td{border-bottom-color:var(--table-border)}.file-name a{color:var(--accent-teal)}.folder-icon{color:var(--folder-icon-color)}.file-icon{color:var(--file-icon-color)}.empty-state{color:var(--text-muted)!important}table{background:var(--card-bg);border-color:var(--card-border)}th{background:var(--table-header-bg);color:var(--table-header-text)}th,td{border-bottom-color:var(--table-border);color:var(--text-primary)}.user-table th,.user-table td{border-bottom-color:var(--table-border)}.user-table th{color:var(--table-header-text)}.user-table tbody th{color:var(--text-primary)}.filter-label input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.table-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text-primary)}.method.GET{background:var(--method-get-bg);color:var(--method-get-text)}.method.PUT{background:var(--method-put-bg);color:var(--method-put-text)}.method.DELETE{background:var(--method-delete-bg);color:var(--method-delete-text)}.method.MKCOL{background:var(--method-mkcol-bg);color:var(--method-mkcol-text)}.method.COPY,.method.MOVE{background:#251a2e;color:#b88fd0}.method.PROPFIND{background:#152a25;color:#5ec9a0}.status.success{background:var(--status-success-bg);color:var(--status-success-text)}.status.warn{background:var(--status-warn-bg);color:var(--status-warn-text)}.status.error{background:var(--status-error-bg);color:var(--status-error-text)}.restore-btn{background:var(--status-success-text);color:#fff}.empty-btn{background:var(--danger-text)}.theme-toggle{position:absolute;right:16px;top:50%;transform:translateY(-50%);display:grid;place-items:center;width:36px;height:36px;border:1px solid rgba(255,255,255,.2);border-radius:50%;background:rgba(255,255,255,.08);color:var(--topbar-text);cursor:pointer;font-size:16px;padding:0;transition:background .2s,border-color .2s,transform .15s;flex-shrink:0;z-index:10}.theme-toggle:hover{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.35);transform:translateY(-50%) scale(1.08)}.login-shell .theme-toggle{position:fixed;top:20px;right:20px;z-index:999;border-color:rgba(255,255,255,.3);background:rgba(0,0,0,.25);backdrop-filter:blur(8px)}[data-theme="dark"] .summary-card:hover,[data-theme="dark"] .config-card:hover{box-shadow:0 18px 38px rgba(0,0,0,.3)}[data-theme="dark"] .file-table-wrap{box-shadow:0 12px 30px rgba(0,0,0,.2)}[data-theme="dark"] .login-panel{box-shadow:0 24px 70px rgba(0,0,0,.4)}[data-theme="dark"] .topbar{box-shadow:0 3px 16px rgba(0,0,0,.35)}[data-theme="dark"] .login-shell{background:radial-gradient(circle at 15% 15%,rgba(229,174,89,.08),transparent 32%),linear-gradient(145deg,#0c1618,#162e30)}[data-theme="dark"] .login-shell:before{border-color:rgba(255,255,255,.05)}[data-theme="dark"] a{color:var(--link-color)}@media(max-width:720px){.topbar-inner{flex-wrap:wrap;gap:8px;padding-right:52px}.topbar-right{gap:8px}}`;
+var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.file-actions{display:flex;align-items:stretch;gap:12px}.file-actions form{display:flex;align-items:stretch;flex-wrap:nowrap;gap:8px;min-height:44px}.file-actions input[type=file],.mkdir-form input,.file-actions button{height:44px;min-height:44px}.file-actions input[type=file],.mkdir-form input{display:flex;align-items:center;padding:0 12px}.file-actions input[type=file]{min-width:260px}.mkdir-form input{min-width:220px}.file-actions button{white-space:nowrap}@media(max-width:720px){.file-actions{align-items:stretch}.file-actions form{width:100%;flex-wrap:nowrap}.file-actions input[type=file],.mkdir-form input{min-width:0;flex:1}}`;
+
 
 const THEME_SCRIPT = `<script>(function(){var s=localStorage.getItem('cf-webdav-theme');var d=window.matchMedia('(prefers-color-scheme:dark)').matches;if(s==='dark'||(!s&&d))document.documentElement.setAttribute('data-theme','dark')})();function toggleTheme(){var h=document.documentElement;var dark=h.getAttribute('data-theme')==='dark';if(dark){h.removeAttribute('data-theme');localStorage.setItem('cf-webdav-theme','light')}else{h.setAttribute('data-theme','dark');localStorage.setItem('cf-webdav-theme','dark')}var t=document.querySelectorAll('.theme-toggle');for(var i=0;i<t.length;i++)t[i].textContent=dark?'\\u{1F319}':'\\u2600\\uFE0F'}</script>`;
 
