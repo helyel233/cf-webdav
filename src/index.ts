@@ -1086,7 +1086,8 @@ async function listAllObjects(env: Env, prefix: string): Promise<R2Object[]> {
   const result: R2Object[] = [];
   let cursor: string | undefined;
   do {
-    const page = await env.WEBDAV_BUCKET.list({ prefix, cursor });
+    // 必须显式 include customMetadata，否则回收站恢复/永久删除无法通过 originalPath 匹配对象
+    const page = await env.WEBDAV_BUCKET.list({ prefix, cursor, include: ["customMetadata"] });
     result.push(...page.objects);
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
