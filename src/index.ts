@@ -578,7 +578,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
       return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
-    if (view === "files" && ["upload", "delete", "mkdir"].includes(action)) {
+    if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       return adminFilesAction(request, env, form, sessionUser_, selected.username, selected);
@@ -785,6 +785,17 @@ function adminPath(value: string): string {
   return path;
 }
 
+// 批量操作：收集勾选路径并归一化（非法路径直接丢弃）
+function normalizeBatchPaths(form: FormData): string[] {
+  return form.getAll("paths").map(String).map((value) => {
+    try { return adminPath(value); } catch { return ""; }
+  }).filter(Boolean);
+}
+
+function filesPageRedirect(accountUsername: string, currentPath: string, extraQuery = ""): Response {
+  return new Response(null, { status: 303, headers: { Location: `/?view=files&account=${encodeURIComponent(accountUsername)}${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}${extraQuery}` } });
+}
+
 async function adminFilesAction(request: Request, env: Env, form: FormData, username: string, accountUsername: string, account: WebdavAccount): Promise<Response> {
   const scopedEnv = createScopedEnv(env, storageScope(account));
   const action = String(form.get("action") || "");
@@ -816,6 +827,38 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       operationMethod = "DELETE";
       const response = await deletePath(scopedEnv, operationPath);
       responseStatus = response.status;
+    } else if (action === "batch-delete") {
+      // 批量删除：文件与目录统一走 deletePath 软删除，可在回收站恢复
+      const paths = normalizeBatchPaths(form);
+      if (!paths.length) return textResponse("请先勾选要删除的文件或目录", 400);
+      operationMethod = "DELETE";
+      let deletedCount = 0;
+      for (const path of paths) {
+        const response = await deletePath(scopedEnv, path);
+        if (response.status >= 400) continue;
+        deletedCount++;
+        await logAccess(env, { method: "DELETE", path, status: response.status, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
+      }
+      return filesPageRedirect(accountUsername, currentPath, `&deleted=${deletedCount}`);
+    } else if (action === "batch-move") {
+      // 批量移动：目标目录已存在同名内容时跳过该项，回跳后提示统计结果
+      const paths = normalizeBatchPaths(form);
+      if (!paths.length) return textResponse("请先勾选要移动的文件或目录", 400);
+      let targetDir = "";
+      try { targetDir = adminPath(String(form.get("targetDir") || "")); } catch { return textResponse("目标目录路径不合法", 400); }
+      operationMethod = "MOVE";
+      let movedCount = 0;
+      let skippedCount = 0;
+      for (const source of paths) {
+        const result = await moveEntryTo(scopedEnv, source, targetDir);
+        if (result === "moved") {
+          movedCount++;
+          await logAccess(env, { method: "MOVE", path: source, status: 201, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
+        } else {
+          skippedCount++;
+        }
+      }
+      return filesPageRedirect(accountUsername, currentPath, `&moved=${movedCount}&skipped=${skippedCount}`);
     }
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
@@ -839,12 +882,21 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
     .map((item) => item.slice(0, -1));
   const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+  // 批量操作结果提示（重定向回跳参数）
+  const deleted = url.searchParams.get("deleted");
+  const moved = url.searchParams.get("moved");
+  const skipped = url.searchParams.get("skipped");
+  const noticeParts: string[] = [];
+  if (deleted && deleted !== "0") noticeParts.push(`成功删除 ${deleted} 项，内容已移入回收站`);
+  if (moved !== null) noticeParts.push(`成功移动 ${moved} 项${skipped && skipped !== "0" ? `，跳过 ${skipped} 项（目标目录已存在同名内容）` : ""}`);
+  const batchNotice = noticeParts.length ? `<div class="batch-notice">${noticeParts.join("；")}</div>` : "";
+  const batchToolbar = `<form id="files-batch-form" method="post" action="/?view=files" class="batch-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><span class="batch-hint">已选 <b id="batch-count">0</b> 项</span><input class="batch-target-input" name="targetDir" placeholder="移动目标目录，如 photos/2024，留空为根目录"><button class="secondary-button" type="submit" name="action" value="batch-move" onclick="return confirmBatchMove()">移动选中</button><button class="danger-button" type="submit" name="action" value="batch-delete" onclick="return confirmBatchDelete()">删除选中</button></form><script>function checkedFileCount(){return document.querySelectorAll('.file-check:checked').length}function toggleFileSelect(checked){document.querySelectorAll('.file-check').forEach(function(c){c.checked=checked});updateBatchCount()}function updateBatchCount(){var el=document.getElementById('batch-count');if(el)el.textContent=checkedFileCount()}function confirmBatchDelete(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}return confirm('确定删除选中的 '+n+' 项吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')}function confirmBatchMove(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}var t=document.querySelector('input[name=targetDir]').value.trim()||'根目录';return confirm('确定将选中的 '+n+' 项移动到「'+t+'」吗？目标已存在同名内容时将跳过。')}document.addEventListener('change',function(e){if(e.target&&e.target.classList&&e.target.classList.contains('file-check'))updateBatchCount()})</script>`;
   const rows = [
-    ...(currentPath ? [`<tr><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
-    ...directories.map((directory) => `<tr><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`),
-    ...files.map((file) => `<tr><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td>${formatDateTime(file.uploaded)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+    ...(currentPath ? [`<tr><td class="check-col"></td><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
+    ...directories.map((directory) => `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(directory)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(directory)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+    ...files.map((file) => `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(file.key)}"></td><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td>${formatDateTime(file.uploaded)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
   ].join("");
-    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a>`)}<section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>选择一个文件上传到当前目录</span></div><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section></main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a>`)}${batchNotice}<section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>选择一个文件上传到当前目录</span></div><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th class="check-col"><input type="checkbox" id="files-select-all" onchange="toggleFileSelect(this.checked)" title="全选" aria-label="全选"></th><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section>${batchToolbar}</main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -1517,6 +1569,62 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
   return new Response(null, { status: 201 });
 }
 
+// 管理界面批量移动：将文件或目录（含全部子内容）移动到目标目录下。
+// 目标已存在同名内容时跳过（覆盖即不可逆丢失）；目录复制阶段全部成功后才清理源，失败即回滚已写入部分并保留源。
+// 同一账户内移动字节数不变，不调整用量缓存。
+async function moveEntryTo(env: Env, source: string, targetDir: string): Promise<"moved" | "conflict" | "missing"> {
+  const name = source.slice(source.lastIndexOf("/") + 1);
+  const destination = targetDir ? `${targetDir}/${name}` : name;
+  if (destination === source || destination.startsWith(`${source}/`)) return "conflict";
+
+  const sourceObject = await env.WEBDAV_BUCKET.head(r2Key(source));
+  const isDirectory = !sourceObject;
+  if (isDirectory && !(await env.WEBDAV_KV.get(dirKey(source))) && !(await hasChildren(env, source))) return "missing";
+
+  const destinationObject = await env.WEBDAV_BUCKET.head(r2Key(destination));
+  if (destinationObject || (isDirectory && (await env.WEBDAV_KV.get(dirKey(destination)) || await hasChildren(env, destination)))) return "conflict";
+
+  if (isDirectory) {
+    const objects = await listAllObjects(env, `${source}/`);
+    const written: string[] = [];
+    try {
+      for (const item of objects) {
+        const body = await env.WEBDAV_BUCKET.get(item.key);
+        if (!body) throw new Error(`failed to read ${item.key}`);
+        const target = `${destination}/${item.key.slice(source.length + 1)}`;
+        await env.WEBDAV_BUCKET.put(target, body.body, { httpMetadata: body.httpMetadata });
+        written.push(target);
+      }
+    } catch (error) {
+      for (const key of written) await env.WEBDAV_BUCKET.delete(key);
+      throw error;
+    }
+    // 搬移源目录及其子目录的 dir: 标记（含目录自身，否则 PROPFIND 不可见）
+    for (const key of await listAllKV(env, DIR_PREFIX)) {
+      const directory = decodeURIComponent(key.slice(DIR_PREFIX.length));
+      if (directory === source || directory.startsWith(`${source}/`)) {
+        await env.WEBDAV_KV.put(dirKey(`${destination}${directory.slice(source.length)}`), new Date().toISOString());
+      }
+    }
+    for (let index = 0; index < objects.length; index += 1000) {
+      await env.WEBDAV_BUCKET.delete(objects.slice(index, index + 1000).map((item) => item.key));
+    }
+    await deleteMetadataUnder(env, source);
+  } else {
+    const content = await env.WEBDAV_BUCKET.get(r2Key(source));
+    if (!content) return "missing";
+    await env.WEBDAV_BUCKET.put(r2Key(destination), content.body, { httpMetadata: content.httpMetadata });
+    const sourceMeta = await env.WEBDAV_KV.get(metaKey(source));
+    if (sourceMeta) await env.WEBDAV_KV.put(metaKey(destination), sourceMeta);
+    await env.WEBDAV_BUCKET.delete(r2Key(source));
+    await env.WEBDAV_KV.delete(metaKey(source));
+  }
+
+  // 目标父链目录标记不存在时补建，保证移动后可正常浏览
+  await ensureDirectoryMarkers(env, [destination]);
+  return "moved";
+}
+
 const SUPPORTEDLOCK_XML = `<d:supportedlock><d:lockentry><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockentry><d:lockentry><d:lockscope><d:shared/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockentry></d:supportedlock>`;
 
 // 请求级预取账户内全部锁，避免 PROPFIND 逐条目遍历 KV
@@ -1865,6 +1973,15 @@ var DARK_MODE_CSS = `:root{--bg-gradient:linear-gradient(135deg,#f6f8f5 0%,#e8ef
 var TABLE_POLISH_CSS = `.data-table-wrap{overflow-x:auto;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow)}.data-table,.user-table,.file-table-wrap table{width:100%;border-collapse:collapse}.data-table th,.data-table td,.user-table th,.user-table td,.file-table-wrap th,.file-table-wrap td{padding:14px 16px;text-align:left;vertical-align:middle;border-bottom:1px solid var(--table-border)}.data-table th,.user-table th,.file-table-wrap th{background:var(--table-header-bg);color:var(--table-header-text);font-size:12px;font-weight:800;letter-spacing:.04em}.data-table tbody tr:last-child td,.user-table tbody tr:last-child td,.file-table-wrap tbody tr:last-child td{border-bottom:0}.data-table .path{max-width:320px}.primary-button,.secondary-button,.danger-button,.restore-btn,.empty-btn{min-height:40px;display:inline-flex;align-items:center;justify-content:center;line-height:1.2}.data-table form{margin:0}.method,.status{display:inline-flex;align-items:center;min-height:26px;padding:3px 8px}.empty-form{display:flex;justify-content:flex-end;gap:10px}.empty-btn{margin-top:18px}`;
 const FILES_CSS = `
 .secondary-button{padding:12px 18px;border:1px solid #397277;border-radius:2px;background:#fff;color:#285b60;font:inherit;font-weight:800;cursor:pointer}.inline-button{display:inline-block;margin:12px 0 18px}.file-table-wrap{overflow-x:auto;background:rgba(255,255,255,.82);border:1px solid #d7e0dc}.file-table-wrap table{width:100%;border-collapse:collapse;min-width:640px}.file-table-wrap th,.file-table-wrap td{padding:15px 18px;text-align:left;border-bottom:1px solid #e0e7e3}.file-table-wrap th{background:#f2f6f3;color:#60716d;font-size:12px}.file-name{font-weight:700}.file-name a{color:#285b60}.folder-icon,.file-icon{display:inline-block;width:34px;margin-right:8px;color:#a47735;font-size:9px;font-weight:900}.file-icon{color:#51817c}.danger-button{padding:7px 11px;border:1px solid #c76c61;border-radius:2px;background:#fff5f3;color:#a43f35;font:inherit;font-size:12px;cursor:pointer}.empty-state{text-align:center;color:#71807e;padding:36px!important}
+.check-col{width:44px;text-align:center}
+td.check-col{text-align:center}
+.file-check{width:16px;height:16px;cursor:pointer;vertical-align:middle}
+.batch-notice{margin:0 0 18px;padding:12px 16px;background:#e7f4eb;border-left:3px solid #3d9368;border-radius:0 4px 4px 0;color:#176b48;font-size:14px}
+[data-theme="dark"] .batch-notice{background:#152a22;color:#5ec98f}
+.batch-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:10px;margin:16px 0 0}
+.batch-hint{margin-right:auto;font-size:13px;color:var(--text-secondary)}
+.batch-toolbar .batch-target-input{flex:1;min-width:200px;max-width:320px;height:40px;padding:0 10px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit}
+.batch-toolbar .secondary-button,.batch-toolbar .danger-button{margin:0;height:40px;min-height:40px;padding:0 16px}
 `;
 
 var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.storage-badge{display:flex;flex-direction:column;gap:5px;padding:12px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow);font-size:13px;color:var(--text-secondary);white-space:nowrap}.storage-badge strong{color:var(--text-primary);font-size:15px;letter-spacing:-.02em}`;
