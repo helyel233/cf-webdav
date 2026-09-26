@@ -928,8 +928,10 @@ function dirKey(path: string): string {
 }
 
 function optionsResponse(): Response {
+  // 必须返回 200：部分客户端（如 webdav_client 系 App）写入前用 OPTIONS 探测并严格要求 200，
+  // RFC 4918 允许 200/204，主流 WebDAV 服务器（Apache/nginx）均返回 200
   return new Response(null, {
-    status: 204,
+    status: 200,
     headers: { Allow: METHODS.join(", "), DAV: "1, 2", "MS-Author-Via": "DAV" },
   });
 }
