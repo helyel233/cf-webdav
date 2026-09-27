@@ -28,3 +28,31 @@ DAV_PREFIX = ""
 ENABLE_ACCESS_LOG = "true"
 # 设为 "false" 可关闭公开注册，仅超级管理员可在后台创建用户（默认开启）
 # ENABLE_PUBLIC_REGISTRATION = "false"
+
+# —— 以下均为可选配置，取消注释即可生效 ——
+
+# 访问日志保留天数（默认 30，范围 1-365）；到期条目靠 KV TTL 自动过期，写入时即设置
+# LOG_RETENTION_DAYS = "30"
+
+# "true" 时访问日志中的客户端 IP 脱敏（IPv4 保留前三段 / IPv6 保留前四组），合规审计场景使用
+# LOG_IP_REDACT = "true"
+
+# 单次 PUT 上传字节上限（字节，0/缺省 = 不限制，超出返回 413 并带 X-Upload-Limit 头）
+# MAX_UPLOAD_BYTES = "1073741824"
+
+# 密码策略：最小长度（默认 8，范围 8-128），另要求密码同时包含字母与数字
+# MIN_PASSWORD_LENGTH = "8"
+
+# 会话空闲超时分钟数（0/缺省 = 不启用；启用后无操作超过该时长会话失效）
+# SESSION_IDLE_MINUTES = "60"
+
+# 登录防爆破：窗口期内最大失败次数（默认 5）与锁定分钟数（默认 15）
+# LOGIN_MAX_ATTEMPTS = "5"
+# LOGIN_LOCK_MINUTES = "15"
+
+# /.well-known/security.txt（RFC 9116）漏洞报告联系方式，如 mailto:security@example.com
+# SECURITY_CONTACT = "mailto:security@example.com"
+
+# Turnstile 人机校验（公开注册防滥用）：两项同时配置才启用
+# TURNSTILE_SITE_KEY = "0x4AAAAAAA..."
+# TURNSTILE_SECRET_KEY = "0x4AAAAAAA..."

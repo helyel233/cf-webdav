@@ -8,9 +8,13 @@
 
 - 标准方法：`OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY`、`MOVE`
 - **RFC 4918 Class 2 锁**：`LOCK` / `UNLOCK`，支持独占写锁、`Depth` 锁、超时刷新与 `If` 头锁令牌校验，兼容 Office 等编辑器的 LOCK-EDIT-UNLOCK 流程
+- **RFC 6578 增量同步**：`REPORT` `sync-collection`，客户端凭 `sync-token` 仅拉取上次同步后新增/修改/删除的条目，适合 rclone bisync 与移动端离线缓存
+- **RFC 5323 检索**：`SEARCH` 按文件名子串匹配（`LIKE '%关键词%'` 或引号关键词），跨目录查找文件
 - **Range 部分内容**：`GET` 支持 `Range` 请求头，返回 `206 Partial Content`，越界返回 `416`
 - **条件请求**：`If-Match` / `If-None-Match` 用于写入前置校验，不满足返回 `412`
-- **RFC 4331 配额属性**：`PROPFIND` 返回可用容量与已用容量
+- **RFC 4331 配额属性**：`PROPFIND` 返回可用容量与已用容量，另返回 `creationdate` 创建时间
+- **协议细节**：路径统一 Unicode NFC 规范化（避免 macOS Finder NFD 文件名跨平台重复）、拒绝控制字符；带请求体的 `MKCOL` 返回 `415`；`GET` 集合返回 `405`；`OPTIONS` 声明 `DAV: 1, 2` 与 `MS-Author-Via: DAV`
+- **上传限额**：配置 `MAX_UPLOAD_BYTES` 后单次 `PUT` 超限返回 `413` 并附 `X-Upload-Limit` 头
 - 支持 `Depth: 0` / `1` / `infinity` 目录列举
 - **流量限制**：默认每分钟 60 次请求、每小时上传 1GB，超出返回 `429`
 
@@ -19,18 +23,20 @@
 浏览器访问 Worker 根路径即可进入管理界面，采用「超级管理员 → 用户 → WebDAV 账户」三级体系：
 
 - **超级管理员**：创建和删除用户、删除用户名下的 WebDAV 账户（含清理 owner 已不存在的孤儿账户）、查看全量访问日志；不可查看任何文件内容
-- **普通用户**：修改自己的密码（需校验当前密码）、创建并管理自己名下的 WebDAV 账户（每人最多 2 个）、管理文件、查看自己及名下账户的访问日志、使用回收站
+- **普通用户**：修改自己的密码（需校验当前密码）、创建并管理自己名下的 WebDAV 账户（每人最多 2 个）、管理文件、查看自己及名下账户的访问日志、使用回收站、**一键导出个人数据**（JSON，含资料/账户/访问日志/分享记录，不含密码哈希）
 - **文件管理**：浏览、上传、新建目录、删除，删除的文件和目录进入回收站，**30 天内可恢复**（支持批量恢复与永久删除）
-- **访问日志**：记录请求方法、路径、状态码、客户端 IP、User-Agent 与操作账户
+- **访问日志**：记录请求方法、路径、状态码、客户端 IP、User-Agent 与操作账户；保留天数可配置（`LOG_RETENTION_DAYS`，默认 30），可开启 IP 脱敏（`LOG_IP_REDACT`）
 - **存储用量**：用户管理页展示总容量与已用容量徽章，用户列表包含每人已用空间
 
 ### 会话与安全
 
-- 会话 Cookie：`HttpOnly` / `Secure` / `SameSite=Strict`，随机 32 字节 Token，7 天有效
+- 会话 Cookie：`HttpOnly` / `Secure` / `SameSite=Strict`，随机 32 字节 Token，7 天有效；可启用空闲超时（`SESSION_IDLE_MINUTES`，无操作超过该时长会话失效）
 - **登出、修改密码、删除用户均即时吊销服务端会话**，已泄露的 Token 不会残留有效
-- 密码使用 PBKDF2-SHA256（10 万次迭代）+ 每账户独立随机盐存储
-- **登录防爆破**：同一 IP + 用户名连续失败 5 次锁定 15 分钟
-- **公开注册限频**：同一 IP 每小时最多注册 5 次，可用 `ENABLE_PUBLIC_REGISTRATION=false` 完全关闭注册
+- 密码使用 PBKDF2-SHA256（10 万次迭代）+ 每账户独立随机盐存储；密码策略可配置（`MIN_PASSWORD_LENGTH`，另要求同时包含字母与数字）
+- **登录防爆破**：同一 IP + 用户名连续失败次数与锁定时长可配置（`LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCK_MINUTES`，默认 5 次 15 分钟）
+- **公开注册限频**：同一 IP 每小时最多注册 5 次，可用 `ENABLE_PUBLIC_REGISTRATION=false` 完全关闭注册；配置 Turnstile 后注册需通过人机校验
+- **管理审计日志**：登录、注册、改密、创建/删除账户与用户、调整配额、安全设置变更等敏感操作全量留痕，仅超级管理员可查看（`/?view=audit`）并导出 CSV（`/?view=audit&export=csv`），保留 365 天
+- **合规端点**：`/robots.txt` 与 `/.well-known/security.txt`（RFC 9116，联系方式用 `SECURITY_CONTACT` 配置）无需认证即可访问
 - 管理后台与 WebDAV 协议（Basic Auth）凭证相互独立
 
 ## 架构说明
@@ -160,6 +166,18 @@ npm run typecheck
 curl -i -u admin:change-this-local-password -X OPTIONS http://localhost:8787/
 printf 'hello\n' | curl -i -u admin:change-this-local-password -T - http://localhost:8787/docs/hello.txt
 curl -i -u admin:change-this-local-password -X PROPFIND -H 'Depth: 1' http://localhost:8787/docs/
+# RFC 6578 增量同步：首次获取 sync-token，再凭 token 拉取变更
+curl -s -u admin:change-this-local-password -X REPORT -H 'Depth: 1' \
+  -H 'Content-Type: application/xml' --data \
+  '<?xml version="1.0"?><d:sync-collection xmlns:d="DAV:"><d:sync-token/><d:sync-prop><d:getetag/></d:sync-prop></d:sync-collection>' \
+  http://localhost:8787/docs/
+# RFC 5323 文件名检索
+curl -s -u admin:change-this-local-password -X SEARCH -H 'Content-Type: application/xml' --data \
+  '<?xml version="1.0"?><d:searchrequest xmlns:d="DAV:"><d:basicsearch><d:select><d:prop><d:getcontentlength/></d:prop></d:select><d:from><d:scope><d:href>/</d:href><d:depth>infinity</d:depth></d:scope></d:from><d:where><d:like><d:prop><d:displayname/></d:prop><d:literal>%hello%</d:literal></d:like></d:where></d:basicsearch></d:searchrequest>' \
+  http://localhost:8787/
+# 合规端点（无需认证）
+curl -s http://localhost:8787/robots.txt
+curl -s http://localhost:8787/.well-known/security.txt
 ```
 
 ## 首次使用
@@ -185,6 +203,16 @@ curl -i -u 账户:密码 -X PROPFIND -H 'Depth: 1' https://你的-worker.workers
 | `DAV_PREFIX` | var | 否 | 路径前缀，留空为根路径，可设 `team-files` |
 | `ENABLE_ACCESS_LOG` | var | 否 | `true` 启用访问日志（默认开启，[wrangler.toml](wrangler.toml) 已显式设置） |
 | `ENABLE_PUBLIC_REGISTRATION` | var | 否 | 设为 `false` 关闭公开注册，仅超管可在后台创建用户 |
+| `LOG_RETENTION_DAYS` | var | 否 | 访问日志保留天数（默认 30，范围 1-365），到期靠 KV TTL 自动过期 |
+| `LOG_IP_REDACT` | var | 否 | `true` 时访问日志中客户端 IP 脱敏（IPv4 保留前三段 / IPv6 保留前四组） |
+| `MAX_UPLOAD_BYTES` | var | 否 | 单次 PUT 上传字节上限（0/缺省 = 不限制），超出返回 `413` |
+| `MIN_PASSWORD_LENGTH` | var | 否 | 密码最小长度（默认 8，范围 8-128），另要求同时包含字母与数字 |
+| `SESSION_IDLE_MINUTES` | var | 否 | 会话空闲超时分钟数（0/缺省 = 不启用） |
+| `LOGIN_MAX_ATTEMPTS` | var | 否 | 登录防爆破窗口期内最大失败次数（默认 5） |
+| `LOGIN_LOCK_MINUTES` | var | 否 | 登录防爆破锁定分钟数（默认 15） |
+| `SECURITY_CONTACT` | var | 否 | security.txt 漏洞报告联系方式，如 `mailto:security@example.com` |
+| `TURNSTILE_SITE_KEY` | var | 否 | Turnstile 人机校验站点密钥（与 SECRET 同时配置才启用，用于公开注册） |
+| `TURNSTILE_SECRET_KEY` | Secret | 否 | Turnstile 服务端校验密钥 |
 | `ADMIN_USERNAME` | Secret | 否 | 超级管理员账户名，仅在账户不存在时一次性引导 |
 | `ADMIN_PASSWORD` | Secret | 否 | 超级管理员密码（≥ 8 位） |
 | `WEBDAV_USERNAME` | Secret | 否 | 可选，预设初始 WebDAV 客户端账户 |

@@ -10,3 +10,27 @@ ADMIN_PASSWORD=change-this-local-password
 
 # 访问日志开关（true 时记录上传/下载/删除/恢复等操作，可在后台查看）
 ENABLE_ACCESS_LOG=true
+
+# 可选：日志保留天数（默认 30，1-365）与 IP 脱敏
+# LOG_RETENTION_DAYS=30
+# LOG_IP_REDACT=true
+
+# 可选：单次 PUT 上传字节上限（字节，0/缺省 = 不限制）
+# MAX_UPLOAD_BYTES=1073741824
+
+# 可选：密码策略（最小长度，另要求同时包含字母与数字）
+# MIN_PASSWORD_LENGTH=8
+
+# 可选：会话空闲超时分钟数（0/缺省 = 不启用）
+# SESSION_IDLE_MINUTES=60
+
+# 可选：登录防爆破（窗口期内最大失败次数 / 锁定分钟数）
+# LOGIN_MAX_ATTEMPTS=5
+# LOGIN_LOCK_MINUTES=15
+
+# 可选：/.well-known/security.txt 漏洞报告联系方式（RFC 9116）
+# SECURITY_CONTACT=mailto:security@example.com
+
+# 可选：Turnstile 人机校验（公开注册防滥用，两项同时配置才启用）
+# TURNSTILE_SITE_KEY=
+# TURNSTILE_SECRET_KEY=

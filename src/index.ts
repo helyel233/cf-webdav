@@ -9,6 +9,25 @@ interface Env {
   // 新增：启用访问日志
   ENABLE_ACCESS_LOG?: string;
   ENABLE_PUBLIC_REGISTRATION?: string;
+  // —— 合规与协议可选配置 ——
+  // 访问日志保留天数（默认 30，1-365）
+  LOG_RETENTION_DAYS?: string;
+  // "true" 时访问日志中的 IP 脱敏（IPv4 保留前三段 / IPv6 保留前四组）
+  LOG_IP_REDACT?: string;
+  // 单次 PUT 上传字节上限（0/缺省 = 不限制，由平台请求体上限兜底）
+  MAX_UPLOAD_BYTES?: string;
+  // 密码最小长度（默认 8，8-128；密码另须同时包含字母与数字）
+  MIN_PASSWORD_LENGTH?: string;
+  // 会话空闲超时分钟数（0/缺省 = 不启用，会话固定 7 天）
+  SESSION_IDLE_MINUTES?: string;
+  // 登录防爆破：窗口期内最大失败次数（默认 5）与锁定分钟数（默认 15）
+  LOGIN_MAX_ATTEMPTS?: string;
+  LOGIN_LOCK_MINUTES?: string;
+  // /.well-known/security.txt（RFC 9116）漏洞报告联系方式，如 mailto:security@example.com
+  SECURITY_CONTACT?: string;
+  // Turnstile 人机校验（公开注册防滥用）：两项同时配置才启用
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
 }
 interface FileMeta {
   type: "file";
@@ -28,7 +47,25 @@ interface AccessLog {
   bytesSent?: number;
   user: string;
 }
-const METHODS = ["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH"];
+const METHODS = ["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH", "REPORT", "SEARCH"];
+// 新增：管理审计日志（敏感操作流水，仅超级管理员可查看导出，普通用户不可见不可删）
+interface AuditLog {
+  timestamp: string;
+  actor: string;
+  action: string;
+  target: string;
+  clientIp: string;
+  detail?: string;
+}
+const AUDIT_PREFIX = "audit:";
+const AUDIT_RETENTION_DAYS = 365;
+// 新增：RFC 6578 sync-collection 变更状态（每账户作用域一份；KV 读改写非原子，仅作增量同步参考）
+interface SyncState {
+  seq: number;
+  changes: Record<string, { seq: number; kind: "modified" | "deleted" }>;
+}
+const SYNC_STATE_KEY = "sync:state";
+const SYNC_MAX_CHANGES = 1000;
 const META_PREFIX = "meta:";
 const DIR_PREFIX = "dir:";
 const CREDENTIALS_KEY = "config:credentials";
@@ -190,8 +227,44 @@ const USER_LIMIT_MAX_GB = 100;
 const DEFAULT_USERNAME = "admin";
 const DEFAULT_PASSWORD = "admin123456";
 const SESSION_TTL = 60 * 60 * 24 * 7;
-const LOG_RETENTION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
+
+// —— 可配置合规/安全参数（环境变量驱动，缺省保持原行为）——
+function intVarOf(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = parseInt(value || "");
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+function getLogRetentionDays(env: Env): number {
+  return intVarOf(env.LOG_RETENTION_DAYS, 30, 1, 365);
+}
+function getMaxUploadBytes(env: Env): number {
+  // 0 = 不限制，由 Cloudflare 平台的请求体上限兜底
+  return intVarOf(env.MAX_UPLOAD_BYTES, 0, 0, 10 * 1024 ** 3);
+}
+function getMinPasswordLength(env: Env): number {
+  return intVarOf(env.MIN_PASSWORD_LENGTH, 8, 8, 128);
+}
+function getSessionIdleSeconds(env: Env): number {
+  // 0 = 不启用空闲超时，会话固定 7 天有效
+  return intVarOf(env.SESSION_IDLE_MINUTES, 0, 0, 60 * 24 * 7) * 60;
+}
+function getLoginLockConfig(env: Env): { maxAttempts: number; windowSeconds: number } {
+  return { maxAttempts: intVarOf(env.LOGIN_MAX_ATTEMPTS, 5, 1, 100), windowSeconds: intVarOf(env.LOGIN_LOCK_MINUTES, 15, 1, 1440) * 60 };
+}
+// 密码策略：最小长度可配，且必须同时包含字母和数字；返回错误信息或 null
+function passwordPolicyError(env: Env, password: string): string | null {
+  const minLength = getMinPasswordLength(env);
+  if (password.length < minLength) return `密码至少需要 ${minLength} 位`;
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) return "密码必须同时包含字母和数字";
+  return null;
+}
+// IP 脱敏：IPv4 保留前 3 段，IPv6 保留前 4 组，降低日志中的个人数据暴露面
+function redactIp(ip: string): string {
+  if (ip.includes(".") && !ip.includes(":")) return `${ip.split(".").slice(0, 3).join(".")}.0`;
+  if (ip.includes(":")) return `${ip.split(":").slice(0, 4).join(":")}::`;
+  return ip;
+}
 export default {
   // 定时维护（每日）：清理 KV 已过期但 R2 残留的回收站孤儿对象；重置用量缓存以实际 R2 重建，消除增量更新漂移
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
@@ -217,6 +290,8 @@ export default {
     if (pathname === "/" && (request.method === "GET" || request.method === "POST")) return adminRequest(request, env);
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
     if (pathname === "/s" || pathname.startsWith("/s/")) return serveShare(request, env);
+    // robots.txt 与 /.well-known/security.txt（RFC 9116）：无需认证的合规固定端点
+    if (request.method === "GET" && (pathname === "/robots.txt" || pathname === "/.well-known/security.txt")) return wellKnownResponse(pathname, env);
     if (request.method === "OPTIONS") return optionsResponse();
     let username = "anonymous";
     const webdavAccount = await authenticate(request, env);
@@ -267,6 +342,8 @@ export default {
         case "LOCK": response = await lockResource(request, scopedEnv, path, username, webdavAccount); break;
         case "UNLOCK": response = await unlockResource(request, scopedEnv, path); break;
         case "PROPPATCH": response = await proppatch(request, scopedEnv, path, webdavAccount); break;
+        case "REPORT": response = await reportMethod(request, scopedEnv, path, webdavAccount); break;
+        case "SEARCH": response = await searchMethod(request, scopedEnv, path, webdavAccount); break;
         default:
           response = textResponse("Method Not Allowed", 405, { Allow: METHODS.join(", ") });
       }
@@ -282,12 +359,14 @@ export default {
 // 新增：记录访问日志；键以倒序毫秒时间戳开头，KV list 字典序升序即最新在前
 async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }): Promise<void> {
   if (env.ENABLE_ACCESS_LOG !== "true") return;
+  // IP 脱敏（LOG_IP_REDACT）与保留天数（LOG_RETENTION_DAYS）均为合规可配置项
+  const retentionDays = getLogRetentionDays(env);
   const accessLog: AccessLog = {
     timestamp: log.timestamp || new Date().toISOString(),
     method: log.method,
     path: log.path,
     status: log.status,
-    clientIp: log.clientIp,
+    clientIp: env.LOG_IP_REDACT === "true" ? redactIp(log.clientIp) : log.clientIp,
     userAgent: log.userAgent,
     bytesSent: log.bytesSent,
     user: log.user,
@@ -303,12 +382,132 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
   }
   const logKey = `${LOG_PREFIX}${String(1e13 - Date.now()).padStart(13, "0")}-${Math.random().toString(36).slice(2)}`;
   try {
-    await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
+    await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: retentionDays * 24 * 60 * 60 });
     await env.WEBDAV_KV.put(dailyKey, String(writtenToday + 1), { expirationTtl: 172800 });
   } catch (error) {
     // 日志写入失败不应影响主请求的响应
     console.error("Failed to write access log", error);
   }
+}
+
+// 管理审计日志：记录敏感操作（登录、改密、TOTP/白名单变更、账户增删、配额调整等），仅超级管理员可查看导出
+async function logAudit(env: Env, entry: Omit<AuditLog, "timestamp"> & { timestamp?: string }): Promise<void> {
+  const auditLog: AuditLog = {
+    timestamp: entry.timestamp || new Date().toISOString(),
+    actor: entry.actor,
+    action: entry.action,
+    target: entry.target,
+    clientIp: entry.clientIp,
+    detail: entry.detail,
+  };
+  const auditKey = `${AUDIT_PREFIX}${String(1e13 - Date.now()).padStart(13, "0")}-${Math.random().toString(36).slice(2)}`;
+  try {
+    await env.WEBDAV_KV.put(auditKey, JSON.stringify(auditLog), { expirationTtl: AUDIT_RETENTION_DAYS * 24 * 60 * 60 });
+  } catch (error) {
+    console.error("Failed to write audit log", error);
+  }
+}
+
+async function listAuditLogs(env: Env, limit = 500): Promise<AuditLog[]> {
+  const logs: AuditLog[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.WEBDAV_KV.list({ prefix: AUDIT_PREFIX, cursor, limit: 100 });
+    const pageLogs = await Promise.all(page.keys.map(async (key) => await env.WEBDAV_KV.get(key.name, "json") as AuditLog | null));
+    for (const log of pageLogs) if (log) logs.push(log);
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && logs.length < limit * 3);
+  logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  return logs.slice(0, limit);
+}
+
+// 彻底清除指定用户（及其 WebDAV 账户）的访问日志与审计记录，用于删除用户时的数据最小化选项
+async function purgeLogsForUsers(env: Env, usernames: string[]): Promise<void> {
+  const targets = new Set(usernames);
+  for (const prefix of [LOG_PREFIX, AUDIT_PREFIX]) {
+    for (const key of await listAllKV(env, prefix)) {
+      const entry = await env.WEBDAV_KV.get(key, "json") as { user?: string; actor?: string } | null;
+      if (entry && ((entry.user && targets.has(entry.user)) || (entry.actor && targets.has(entry.actor)))) await env.WEBDAV_KV.delete(key);
+    }
+  }
+}
+
+// RFC 6578 sync-collection：变更记录存 KV（路径 → 最近变更序号/类型），REPORT 按序号返回增量
+async function readSyncState(env: Env): Promise<SyncState> {
+  try {
+    const state = await env.WEBDAV_KV.get(SYNC_STATE_KEY, "json") as SyncState | null;
+    if (state && Number.isFinite(state.seq) && state.changes) return state;
+  } catch { }
+  return { seq: 0, changes: {} };
+}
+
+async function recordSyncChange(env: Env, path: string, kind: "modified" | "deleted"): Promise<void> {
+  if (!path) return;
+  try {
+    const state = await readSyncState(env);
+    state.seq += 1;
+    state.changes = { ...state.changes, [path]: { seq: state.seq, kind } };
+    const keys = Object.keys(state.changes);
+    if (keys.length > SYNC_MAX_CHANGES) {
+      // 变更记录超上限时淘汰最老条目，避免无限增长
+      keys.sort((a, b) => state.changes[a].seq - state.changes[b].seq);
+      for (const key of keys.slice(0, keys.length - SYNC_MAX_CHANGES)) delete state.changes[key];
+    }
+    await env.WEBDAV_KV.put(SYNC_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // 同步状态记录失败不影响主操作
+  }
+}
+
+// Turnstile 人机校验：配置 TURNSTILE_SECRET_KEY 后公开注册强制验证
+async function verifyTurnstile(env: Env, form: FormData, ip: string): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET_KEY) return true;
+  const token = String(form.get("cf-turnstile-response") || "");
+  if (!token) return false;
+  try {
+    const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ secret: env.TURNSTILE_SECRET_KEY, response: token, remoteip: ip }).toString(),
+    });
+    const data = await res.json() as { success?: boolean };
+    return Boolean(data.success);
+  } catch {
+    return false;
+  }
+}
+
+// robots.txt 与 /.well-known/security.txt（RFC 9116）：搜索引擎禁引与漏洞报告联系方式
+function wellKnownResponse(pathname: string, env: Env): Response {
+  const body = pathname === "/robots.txt"
+    ? "User-agent: *\nDisallow: /\n"
+    : `Contact: ${env.SECURITY_CONTACT || "mailto:admin@example.com"}\nExpires: ${new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)}\nPreferred-Languages: zh-CN, en\n`;
+  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
+}
+
+// 数据可携带性（GDPR/PIPL）：用户可导出自己的全部元数据为 JSON（不含文件内容与密码哈希）
+async function exportUserDataResponse(env: Env, username: string): Promise<Response> {
+  const account = (await getAdminAccounts(env))[username];
+  const ownedAccounts = Object.values(await getWebdavAccounts(env)).filter((item) => item.owner === username);
+  const ownedNames = new Set([username, ...ownedAccounts.map((item) => item.username)]);
+  const logs: AccessLog[] = [];
+  for (const key of await listAllKV(env, LOG_PREFIX)) {
+    const log = await env.WEBDAV_KV.get(key, "json") as AccessLog | null;
+    if (log && ownedNames.has(log.user)) logs.push(log);
+  }
+  const shares: Array<{ account?: string; path?: string; createdAt?: string; expiresAt?: string }> = [];
+  for (const key of await listAllKV(env, SHARE_PREFIX)) {
+    const share = await env.WEBDAV_KV.get(key, "json") as { owner?: string; account?: string; path?: string; createdAt?: string; expiresAt?: string } | null;
+    if (share && share.owner === username) shares.push({ account: share.account, path: share.path, createdAt: share.createdAt, expiresAt: share.expiresAt });
+  }
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    profile: { username, role: account?.role ?? "user", storageLimitBytes: account?.storageLimitBytes ?? 0, totpEnabled: Boolean(account?.totpSecret), ipAllowlist: account?.ipAllowlist ?? [] },
+    webdavAccounts: ownedAccounts.map((item) => ({ username: item.username, uuid: item.uuid ?? "", url: item.url, quotaBytes: item.quotaBytes ?? 0, appPasswordCount: (item.appPasswords ?? []).length })),
+    accessLogs: logs,
+    shares,
+  };
+  return new Response(JSON.stringify(payload, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": `attachment; filename="webdav-data-${encodeURIComponent(username)}-${new Date().toISOString().slice(0, 10)}.json"`, "Cache-Control": "no-store" } });
 }
 
 async function authenticate(request: Request, env: Env): Promise<WebdavAccount | null> {
@@ -526,12 +725,12 @@ function sessionToken(request: Request): string | null {
   return request.headers.get("Cookie")?.match(/(?:^|; )cf_webdav_session=([^;]+)/)?.[1] || null;
 }
 
-// 吊销指定用户的全部会话（session 键的值为用户名）
+// 吊销指定用户的全部会话（会话值为用户名或 { user, lastSeen } JSON）
 async function revokeUserSessions(env: Env, username: string): Promise<void> {
   const sessions = await env.WEBDAV_KV.list({ prefix: SESSION_PREFIX });
   const doomed: Promise<void>[] = [];
   for (const key of sessions.keys) {
-    if (await env.WEBDAV_KV.get(key.name) === username) doomed.push(env.WEBDAV_KV.delete(key.name));
+    if (sessionValueOf(await env.WEBDAV_KV.get(key.name))?.user === username) doomed.push(env.WEBDAV_KV.delete(key.name));
   }
   await Promise.all(doomed);
 }
@@ -613,16 +812,20 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === "/__admin/register") {
     if (env.ENABLE_PUBLIC_REGISTRATION === "false") return adminLoginPage("注册已关闭，请联系管理员创建账户");
-    if (request.method === "GET") return adminRegisterPage();
+    if (request.method === "GET") return adminRegisterPage(env);
     // 公开注册按 IP 限频，防止恶意占满账户名额
     const registerIp = request.headers.get("CF-Connecting-IP") || "unknown";
-    if (!(await checkAuthAttempts(env, `register:${registerIp}`, 5, 3600))) return adminRegisterPage("注册尝试过于频繁，请一小时后再试");
+    if (!(await checkAuthAttempts(env, `register:${registerIp}`, 5, 3600))) return adminRegisterPage(env, "注册尝试过于频繁，请一小时后再试");
     const form = await request.formData();
+    // Turnstile 人机校验：配置 TURNSTILE_SECRET_KEY 后强制验证，防自动化滥用
+    if (!(await verifyTurnstile(env, form, registerIp))) return adminRegisterPage(env, "人机验证未通过，请重试");
     const username = String(form.get("username") || "").trim();
     const password = String(form.get("password") || "");
     const confirmPassword = String(form.get("confirmPassword") || "");
-    if (!isValidUsername(username) || password.length < 8) return adminRegisterPage("用户名格式不正确，密码至少需要 8 位");
-    if (password !== confirmPassword) return adminRegisterPage("两次输入的密码不一致");
+    if (!isValidUsername(username)) return adminRegisterPage(env, "用户名格式不正确");
+    const registerPasswordError = passwordPolicyError(env, password);
+    if (registerPasswordError) return adminRegisterPage(env, registerPasswordError);
+    if (password !== confirmPassword) return adminRegisterPage(env, "两次输入的密码不一致");
     const registerError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
       if (accounts[username]) return "用户账户已存在";
       if (Object.keys(accounts).length >= 10) return "账户最多创建 10 个";
@@ -630,32 +833,39 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
       return null;
     });
-    return registerError ? adminRegisterPage(registerError) : adminLoginPage("注册成功，请使用新账户登录");
+    if (registerError) return adminRegisterPage(env, registerError);
+    await logAudit(env, { actor: username, action: "register", target: username, clientIp: registerIp });
+    return adminLoginPage("注册成功，请使用新账户登录");
   }
   if (url.pathname === "/__admin/login" && request.method === "POST") {
     const form = await request.formData();
     const username = String(form.get("username") ?? "");
     const password = String(form.get("password") ?? "");
+    // 登录防爆破参数可配置（LOGIN_MAX_ATTEMPTS / LOGIN_LOCK_MINUTES）
+    const lock = getLoginLockConfig(env);
+    const lockMessage = `尝试次数过多，请 ${Math.ceil(lock.windowSeconds / 60)} 分钟后再试`;
     const credentials = (await getAdminAccounts(env))[username];
     if (!credentials || !(await verifyPassword(password, credentials.passwordHash, credentials.salt))) {
       // 登录失败按 IP+用户名限频，防止暴力破解
       const loginIp = clientIpOf(request);
-      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, 5, 900))) return adminLoginPage("尝试次数过多，请 15 分钟后再试");
+      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
       return adminLoginPage("用户名或密码错误");
     }
     const loginIp = clientIpOf(request);
     // IP 白名单：密码验证通过后仍需校验来源 IP，未配置则不限制
     if (!ipAllowed(loginIp, credentials.ipAllowlist ?? [])) {
-      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, 5, 900))) return adminLoginPage("尝试次数过多，请 15 分钟后再试");
+      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
       return adminLoginPage("当前 IP 不在该账户的访问白名单内");
     }
     // TOTP 两步验证：已绑定的账户需输入验证器动态码
     if (credentials.totpSecret && !(await verifyTotp(credentials.totpSecret, String(form.get("totpCode") || "")))) {
-      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, 5, 900))) return adminLoginPage("尝试次数过多，请 15 分钟后再试");
+      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
       return adminLoginPage("两步验证码错误或已过期");
     }
+    // 会话记录最后活跃时间（支持 SESSION_IDLE_MINUTES 空闲超时）
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
-    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, username, { expirationTtl: SESSION_TTL });
+    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now() }), { expirationTtl: SESSION_TTL });
+    await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
   }
   const sessionUser_ = await sessionUser(request, env);
@@ -676,7 +886,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const newPassword = String(form.get("newPassword") || "");
       const confirmPassword = String(form.get("confirmPassword") || "");
       if (!sessionAccount || !(await verifyPassword(currentPassword, sessionAccount.passwordHash, sessionAccount.salt))) return adminChangePasswordPage(env, sessionUser_, "", "当前密码不正确");
-      if (newPassword.length < 8) return adminChangePasswordPage(env, sessionUser_, "", "新密码至少需要 8 位");
+      const ownPasswordError = passwordPolicyError(env, newPassword);
+      if (ownPasswordError) return adminChangePasswordPage(env, sessionUser_, "", ownPasswordError);
       if (newPassword !== confirmPassword) return adminChangePasswordPage(env, sessionUser_, "", "两次输入的新密码不一致");
       if (newPassword === currentPassword) return adminChangePasswordPage(env, sessionUser_, "", "新密码不能与当前密码相同");
       const changeError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
@@ -687,6 +898,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         return null;
       });
       if (changeError) return adminChangePasswordPage(env, sessionUser_, "", changeError);
+      await logAudit(env, { actor: sessionUser_, action: "change-own-password", target: sessionUser_, clientIp: clientIpOf(request) });
       // 改密后吊销该用户全部会话（含当前），要求用新密码重新登录
       await revokeUserSessions(env, sessionUser_);
       return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
@@ -741,6 +953,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         return null;
       });
       await env.WEBDAV_KV.delete(`${TOTP_PENDING_PREFIX}${sessionUser_}`);
+      if (!bindError) await logAudit(env, { actor: sessionUser_, action: "totp-enable", target: sessionUser_, clientIp: clientIpOf(request) });
       return bindError ? securityPage(request, env, sessionUser_, { error: bindError }) : securityPage(request, env, sessionUser_, { message: "两步验证已启用，下次登录需输入验证器动态码" });
     }
     if (securityAction === "totp-disable") {
@@ -753,6 +966,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         accounts[sessionUser_] = { ...account, totpSecret: undefined };
         return null;
       });
+      if (!disableError) await logAudit(env, { actor: sessionUser_, action: "totp-disable", target: sessionUser_, clientIp: clientIpOf(request) });
       return disableError ? securityPage(request, env, sessionUser_, { error: disableError }) : securityPage(request, env, sessionUser_, { message: "两步验证已关闭" });
     }
     if (securityAction === "ip-allowlist-save") {
@@ -769,6 +983,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         accounts[sessionUser_] = { ...account, ipAllowlist: entries };
         return null;
       });
+      if (!allowError) await logAudit(env, { actor: sessionUser_, action: "ip-allowlist-save", target: sessionUser_, clientIp: clientIpOf(request), detail: entries.length ? `${entries.length} 条规则` : "已清空" });
       return allowError ? securityPage(request, env, sessionUser_, { error: allowError }) : securityPage(request, env, sessionUser_, { message: entries.length ? "IP 白名单已更新" : "IP 白名单已清空（不再限制登录与 WebDAV 来源）" });
     }
   }
@@ -786,7 +1001,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === adminUsername);
     if (action === "save-user-password") {
       const password = String(form.get("userPassword") || "");
-      if (password.length < 8) return await adminPage(request, env, "用户密码至少需要 8 位");
+      const userPasswordError = passwordPolicyError(env, password);
+      if (userPasswordError) return await adminPage(request, env, userPasswordError);
       // 必须已存在：无条件 upsert 会让已删除账户凭旧会话复活
       const saveError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
         const account = accounts[adminUsername];
@@ -795,14 +1011,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         accounts[adminUsername] = { ...account, salt, passwordHash: await hashPassword(password, salt), role: "user" };
         return null;
       });
-      return saveError ? await adminPage(request, env, saveError) : await adminPage(request, env, "密码已更新");
+      if (saveError) return await adminPage(request, env, saveError);
+      await logAudit(env, { actor: adminUsername, action: "save-user-password", target: adminUsername, clientIp: clientIpOf(request) });
+      return await adminPage(request, env, "密码已更新");
     }
     if (action === "create-admin" || action === "save-admin") return textResponse("普通用户无权执行管理员操作", 403);
     if (action === "create-webdav") {
       const username = String(form.get("serviceUsername") || "").trim();
       const password = String(form.get("servicePassword") || "");
       const uuid = String(form.get("accountUuid") || "").trim();
-      if (password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
+      const createPasswordError = passwordPolicyError(env, password);
+      if (createPasswordError) return await adminPage(request, env, createPasswordError);
       if (!/^\d{6}$/.test(uuid)) return await adminPage(request, env, "UUID 必须是 6 位数字");
       // 查重与写入同事务，消除并发下的重名/同 UUID TOCTOU
       const createError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
@@ -816,7 +1035,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         accounts[username] = account;
         return null;
       });
-      return createError ? await adminPage(request, env, createError) : await adminPage(request, env, "WebDAV 账户已创建");
+      return createError ? await adminPage(request, env, createError) : (await logAudit(env, { actor: adminUsername, action: "create-webdav", target: username, clientIp: clientIpOf(request) }), await adminPage(request, env, "WebDAV 账户已创建"));
     }
     if (action === "delete-webdav") {
       const accountUsername = String(form.get("accountUsername") || "");
@@ -827,7 +1046,9 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         delete accounts[accountUsername];
         return null;
       });
-      return deleteError ? await adminPage(request, env, deleteError) : await adminPage(request, env, "WebDAV 账户及其全部文件已删除");
+      if (deleteError) return await adminPage(request, env, deleteError);
+      await logAudit(env, { actor: adminUsername, action: "delete-webdav", target: accountUsername, clientIp: clientIpOf(request) });
+      return await adminPage(request, env, "WebDAV 账户及其全部文件已删除");
     }
     if (action === "save-service") {
       const accountUsername = String(form.get("accountUsername") || ownedAccounts[0]?.username || "");
@@ -839,7 +1060,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         uuid: String(form.get("accountUuid") || "").trim(),
       };
       if (!/^\d{6}$/.test(service.uuid)) return await adminPage(request, env, "UUID 必须是 6 位数字");
-      if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
+      const servicePasswordError = passwordPolicyError(env, service.password);
+      if (servicePasswordError) return await adminPage(request, env, servicePasswordError);
       // 单账户配额（GB，0 = 不限制）；上限取超管为本用户设置的容量上限（默认 10 GB），超出则拒绝
       const quotaGb = Number(form.get("quotaGb") || "0");
       const quotaCeilingGb = (await getUserStorageLimit(env, adminUsername)) / 1024 ** 3;
@@ -893,7 +1115,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const username = String(form.get("adminUsername") || "").trim();
       const password = String(form.get("adminPassword") || "");
       if (!/^[A-Za-z0-9._-]{2,64}$/.test(username)) return await adminPage(request, env, "管理员账户须为 2-64 位字母、数字、点、下划线或短横线");
-      if (password.length < 8) return await adminPage(request, env, "管理员密码至少需要 8 位");
+      const adminPasswordError = passwordPolicyError(env, password);
+      if (adminPasswordError) return await adminPage(request, env, adminPasswordError);
       const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
       const admins = await getAdminAccounts(env);
       delete admins[adminUsername];
@@ -946,6 +1169,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     if (!previewAccount || previewAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
     return servePreviewRaw(request, env, previewAccount, url);
   }
+  // 数据可携带性：导出当前用户自己的元数据（资料、账户、访问日志、分享），不含文件内容与凭证
+  if (url.searchParams.get("api") === "export-data" && request.method === "GET") return exportUserDataResponse(env, sessionUser_);
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
@@ -976,6 +1201,11 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
 
 async function superAdminRequest(request: Request, env: Env, currentAdmin: AdminAccount): Promise<Response> {
   const url = new URL(request.url);
+  // 审计日志：仅超管可查看与导出（CSV），普通用户不可见不可删
+  if (request.method === "GET" && url.searchParams.get("view") === "audit") {
+    if (url.searchParams.get("export") === "csv") return auditCsvResponse(env);
+    return adminAuditPage(env, url);
+  }
   // 超级管理员可查看全量访问日志
   if (request.method === "GET" && url.searchParams.get("view") === "logs") return adminLogsPage(request, env, [], "/__admin/logs", { view: "logs" });
   if (request.method !== "POST") return superAdminPage(env, "");
@@ -984,7 +1214,8 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
   const accounts = await getAdminAccounts(env);
   if (action === "save-admin-password") {
     const password = String(form.get("adminPassword") || "");
-    if (password.length < 8) return superAdminPage(env, "管理员密码至少需要 8 位");
+    const adminPwError = passwordPolicyError(env, password);
+    if (adminPwError) return superAdminPage(env, adminPwError);
     const saveError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
       const account = accounts[currentAdmin.username];
       if (!account) return "账户不存在";
@@ -993,6 +1224,7 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
       return null;
     });
     if (saveError) return superAdminPage(env, saveError);
+    await logAudit(env, { actor: currentAdmin.username, action: "save-admin-password", target: currentAdmin.username, clientIp: clientIpOf(request) });
     // 改密后吊销全部会话（含当前），要求用新密码重新登录
     await revokeUserSessions(env, currentAdmin.username);
     return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
@@ -1001,7 +1233,8 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
     const username = String(form.get("userUsername") || "").trim();
     const password = String(form.get("userPassword") || "");
     const confirmPassword = String(form.get("userPasswordConfirm") || "");
-    if (!isValidUsername(username) || password.length < 8) return superAdminPage(env, "用户账户格式不正确，密码至少需要 8 位");
+    const createUserPasswordError = passwordPolicyError(env, password);
+    if (!isValidUsername(username) || createUserPasswordError) return superAdminPage(env, createUserPasswordError ?? "用户账户格式不正确");
     if (password !== confirmPassword) return superAdminPage(env, "两次输入的密码不一致");
     const createError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
       if (accounts[username]) return "用户账户已存在";
@@ -1010,7 +1243,9 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
       accounts[username] = { username, salt, passwordHash: await hashPassword(password, salt), role: "user" };
       return null;
     });
-    return createError ? superAdminPage(env, createError) : superAdminPage(env, "用户账户已创建");
+    if (createError) return superAdminPage(env, createError);
+    await logAudit(env, { actor: currentAdmin.username, action: "create-user", target: username, clientIp: clientIpOf(request) });
+    return superAdminPage(env, "用户账户已创建");
   }
   if (action === "create-webdav-admin") {
     return superAdminPage(env, "管理员无权为用户创建 WebDAV 账户");
@@ -1027,17 +1262,21 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
       delete accounts[username];
       return null;
     });
-    return deleteError ? superAdminPage(env, deleteError) : superAdminPage(env, "WebDAV 账户及其文件已删除");
+    if (deleteError) return superAdminPage(env, deleteError);
+    await logAudit(env, { actor: currentAdmin.username, action: "delete-webdav-admin", target: username, clientIp: clientIpOf(request) });
+    return superAdminPage(env, "WebDAV 账户及其文件已删除");
   }
   if (action === "delete-user") {
     const username = String(form.get("userUsername") || "");
     const user = accounts[username];
     if (!user || user.role === "admin" || username === currentAdmin.username) return superAdminPage(env, "只能删除普通用户账户");
     const webdavAccounts = await getWebdavAccounts(env);
+    const deletedAccountNames: string[] = [];
     for (const account of Object.values(webdavAccounts)) {
       if (account.owner === username) {
         await deleteWebdavAccountData(env, account);
         delete webdavAccounts[account.username];
+        deletedAccountNames.push(account.username);
       }
     }
     // 两个账户表分键存储无法原子级联，先删 WebDAV 表再删用户表，失败侧可重试
@@ -1055,6 +1294,10 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
     if (userError) return superAdminPage(env, userError);
     // 删除用户后吊销其全部会话，防止凭旧 cookie 继续操作
     await revokeUserSessions(env, username);
+    // 数据最小化（GDPR/PIPL 被遗忘权）：可选彻底清除该用户及其账户的访问日志与审计记录
+    const purgeLogs = String(form.get("purgeLogs") || "") === "1";
+    if (purgeLogs) await purgeLogsForUsers(env, [username, ...deletedAccountNames]);
+    await logAudit(env, { actor: currentAdmin.username, action: "delete-user", target: username, clientIp: clientIpOf(request), detail: purgeLogs ? "已同步清除访问日志与审计记录" : "" });
     return superAdminPage(env, "用户及其 WebDAV 账户已删除");
   }
   if (action === "adjust-user-limit") {
@@ -1069,7 +1312,9 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
       items[username] = { ...item, storageLimitBytes: limitGb > 0 ? Math.round(limitGb * 1024 ** 3) : 0 };
       return null;
     });
-    return limitError ? superAdminPage(env, limitError) : superAdminPage(env, `用户 ${username} 容量上限已更新`);
+    if (limitError) return superAdminPage(env, limitError);
+    await logAudit(env, { actor: currentAdmin.username, action: "adjust-user-limit", target: username, clientIp: clientIpOf(request), detail: `${limitGb} GB` });
+    return superAdminPage(env, `用户 ${username} 容量上限已更新`);
   }
   if (action === "adjust-dav-quota") {
     const serviceUsername = String(form.get("serviceUsername") || "");
@@ -1085,7 +1330,9 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
       item.quotaBytes = quotaGb > 0 ? Math.round(quotaGb * 1024 ** 3) : 0;
       return null;
     });
-    return quotaError ? superAdminPage(env, quotaError) : superAdminPage(env, `账户 ${serviceUsername} 存储配额已更新`);
+    if (quotaError) return superAdminPage(env, quotaError);
+    await logAudit(env, { actor: currentAdmin.username, action: "adjust-dav-quota", target: serviceUsername, clientIp: clientIpOf(request), detail: `${quotaGb} GB` });
+    return superAdminPage(env, `账户 ${serviceUsername} 存储配额已更新`);
   }
   return superAdminPage(env, "不支持的操作");
 }
@@ -1112,9 +1359,9 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
     const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === user.username);
     const accountRows = ownedAccounts.map((account) => `<div class="account-row"><span>${escapeHtml(account.username)} · ${escapeHtml(account.uuid || "------")} · 配额 ${account.quotaBytes && account.quotaBytes > 0 ? `${(account.quotaBytes / 1024 ** 3).toFixed(1)} GB` : "不限"}</span><form method="post" class="quota-form"><input type="hidden" name="action" value="adjust-dav-quota"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><input name="quotaGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${account.quotaBytes && account.quotaBytes > 0 ? (account.quotaBytes / 1024 ** 3) : 0}" title="GB，0 为不限制" aria-label="配额 GB"><button class="secondary-button compact-button" type="submit">设配额</button></form><form method="post" style="display:inline" onsubmit="return confirm('确定删除此 WebDAV 账户及其全部文件吗？')"><input type="hidden" name="action" value="delete-webdav-admin"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><button class="danger-button compact-button" type="submit">删除</button></form></div>`).join("");
     const limitGb = user.storageLimitBytes && user.storageLimitBytes > 0 ? (user.storageLimitBytes / 1024 ** 3) : 0;
-    return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td>${usageByOwner.get(user.username) ?? "0.00"}</td><td><form method="post" class="limit-form"><input type="hidden" name="action" value="adjust-user-limit"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><input name="limitGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${limitGb}" title="GB，0 为默认 10 GB" aria-label="容量上限 GB">GB<button class="secondary-button compact-button" type="submit">设置</button></form><span class="muted limit-hint">0 = 默认 10 GB</span></td><td><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><button class="danger-button" type="submit">删除用户</button></form></td></tr>`;
+    return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td>${usageByOwner.get(user.username) ?? "0.00"}</td><td><form method="post" class="limit-form"><input type="hidden" name="action" value="adjust-user-limit"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><input name="limitGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${limitGb}" title="GB，0 为默认 10 GB" aria-label="容量上限 GB">GB<button class="secondary-button compact-button" type="submit">设置</button></form><span class="muted limit-hint">0 = 默认 10 GB</span></td><td><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;white-space:nowrap"><input type="checkbox" name="purgeLogs" value="1">同时清除其访问与审计日志</label><button class="danger-button" type="submit">删除用户</button></form></td></tr>`;
   }).join("");
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body>${topbarHtml("超级管理员", `<span class="status-dot">系统管理员</span><a class="text-link inverse" href="/?action=logout">退出当前账户</a>`)}<main class="dashboard">${pageHeadingHtml("ADMINISTRATION", "用户与账户管理", "管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。", `<div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">当前已使用存储空间（GB）</th><th scope="col">容量上限（GB）</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="5" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body>${topbarHtml("超级管理员", `<span class="status-dot">系统管理员</span><a class="text-link inverse" href="/?view=audit">审计日志</a><a class="text-link inverse" href="/?action=logout">退出当前账户</a>`)}<main class="dashboard">${pageHeadingHtml("ADMINISTRATION", "用户与账户管理", "管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。", `<div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">当前已使用存储空间（GB）</th><th scope="col">容量上限（GB）</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="5" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
 }
 
 async function adminLandingPage(request: Request, env: Env, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string, usedStorage: number): Promise<Response> {
@@ -1122,7 +1369,7 @@ async function adminLandingPage(request: Request, env: Env, adminUsername: strin
   const totalGb = String((await getUserStorageLimit(env, adminUsername)) / 1024 ** 3);
   const accountCards = accounts.map((account) => `<a class="config-card account-card account-choice" href="/?view=account&account=${encodeURIComponent(account.username)}"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">账户链接：${escapeHtml(webdavAccountUrl(request, account))}</p><span class="primary-button inline-button">进入账户管理</span></a>`).join("");
   const createForm = accounts.length < 2 ? `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">NEW ACCOUNT</p><h2>新建 WebDAV 账户</h2></div><span class="icon-badge">+</span></div><p class="muted">当前管理员最多拥有 2 个 WebDAV 账户。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="create-webdav"><label>账户<input name="serviceUsername" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" required></label><label>6 位 UUID<div class="uuid-row"><input name="accountUuid" value="${escapeHtml(nextUuid)}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required><button type="button" class="secondary-button uuid-check-btn" onclick="return checkUuidAvailability(this)">检查 UUID</button></div><span id="uuid-check-result" class="uuid-result"></span></label><button class="primary-button" type="submit">创建 WebDAV 账户</button></form></article>` : "";
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("用户管理", `<span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link inverse" href="/?view=change-password">修改密码</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("USER MANAGEMENT", "用户管理", "进入账户后只能管理该账户自己的文件。", `<div class="storage-badge"><span>当前已用容量（GB）：<strong>${usedGb}</strong></span><span>总容量（GB）：<strong>${totalGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("用户管理", `<span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link inverse" href="/?view=change-password">修改密码</a><a class="text-link inverse" href="/?api=export-data">导出我的数据</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("USER MANAGEMENT", "用户管理", "进入账户后只能管理该账户自己的文件。", `<div class="storage-badge"><span>当前已用容量（GB）：<strong>${usedGb}</strong></span><span>总容量（GB）：<strong>${totalGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
 }
 
 async function adminAccountPage(request: Request, env: Env, account: WebdavAccount, newAppPassword = "", appPasswordError = ""): Promise<Response> {
@@ -1142,16 +1389,42 @@ async function adminAccountsPage(request: Request, env: Env, adminUsername: stri
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>账号管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账号管理", `<a class="text-link inverse" href="/">返回管理中心</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("ACCOUNT MANAGEMENT", "账号管理", `当前管理员：${adminUsername}。每个管理员最多拥有两个 WebDAV 账户。`)}<section class="content-grid">${rows}${createForm}</section><section class="config-card admin-account-card"><div class="card-heading"><div><p class="eyebrow">NEW ADMIN</p><h2>创建管理员账户</h2></div></div><form method="post" action="/?view=accounts" class="config-form"><input type="hidden" name="action" value="create-admin"><label>管理员账户<input name="adminUsername" required></label><label>管理员密码<input name="adminPassword" type="password" minlength="8" required></label><button class="primary-button" type="submit">创建管理员</button></form></section></main></body></html>`);
 }
 
+// 会话值兼容两种格式：旧版纯用户名字符串与新版 { user, lastSeen } JSON（支持空闲超时）
+function sessionValueOf(raw: string | null): { user: string; lastSeen: number } | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number };
+    if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen };
+  } catch { }
+  return { user: raw, lastSeen: Date.now() };
+}
+
 async function sessionUser(request: Request, env: Env): Promise<string | null> {
   const token = sessionToken(request);
-  return token ? env.WEBDAV_KV.get(`${SESSION_PREFIX}${token}`) : null;
+  if (!token) return null;
+  const session = sessionValueOf(await env.WEBDAV_KV.get(`${SESSION_PREFIX}${token}`));
+  if (!session) return null;
+  const idleSeconds = getSessionIdleSeconds(env);
+  if (idleSeconds > 0) {
+    if (Date.now() - session.lastSeen > idleSeconds * 1000) {
+      // 空闲超时：吊销会话要求重新登录
+      await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
+      return null;
+    }
+    // 刷新活跃时间（1 分钟节流，避免每次页面请求都写 KV）
+    if (Date.now() - session.lastSeen > 60_000) {
+      await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: session.user, lastSeen: Date.now() }), { expirationTtl: SESSION_TTL });
+    }
+  }
+  return session.user;
 }
 
 function adminPath(value: string): string {
-  const path = value.trim().replace(/^\/+|\/+$/g, "");
+  // NFC 规范化：macOS Finder 以 NFD 分解形式上传文件名，与 Windows/Linux 的 NFC 不一致会产生"同名双文件"，统一入库前规范化
+  const path = value.normalize("NFC").trim().replace(/^\/+|\/+$/g, "");
   if (!path) return "";
   // __trash 为回收站保留命名空间（与 WebDAV 层 requestPath 一致），管理端 mkdir/upload/移动一律拒绝写入
-  if (path.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash")) throw new Error("invalid path");
+  if (path.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash" || /[\u0000-\u001f\u007f-\u009f]/.test(segment))) throw new Error("invalid path");
   return path;
 }
 
@@ -1626,8 +1899,11 @@ async function securityPage(request: Request, env: Env, sessionUser: string, ext
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全设置</title><style>${ADMIN_CSS}</style><body>${topbarHtml("安全设置", `<a class="text-link inverse" href="/">返回首页</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("ACCOUNT SECURITY", "安全设置", "两步验证与来源 IP 限制同时作用于管理后台登录与 WebDAV 客户端访问。")}<section class="content-grid">${totpCard}${allowlistCard}</section></main></body></html>`);
 }
 
-function adminRegisterPage(error = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>注册新用户</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">NEW USER</p><h1>注册新用户</h1><p class="muted">创建用于登录管理界面的普通用户账户。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/register"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">注册新用户</button></form><a class="secondary-button inline-button" href="/">返回登录</a></section></main>`);
+function adminRegisterPage(env: Env, error = ""): Response {
+  const minLength = getMinPasswordLength(env);
+  // Turnstile 组件：配置 TURNSTILE_SITE_KEY 后渲染人机验证（服务端配合 TURNSTILE_SECRET_KEY 强制校验）
+  const turnstile = env.TURNSTILE_SITE_KEY ? `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script><div class="cf-turnstile" data-sitekey="${escapeXml(env.TURNSTILE_SITE_KEY)}" data-theme="auto"></div>` : "";
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>注册新用户</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">NEW USER</p><h1>注册新用户</h1><p class="muted">创建用于登录管理界面的普通用户账户。</p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/register"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="new-password" minlength="${minLength}" required></label><label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="${minLength}" required></label>${turnstile}<button class="primary-button" type="submit">注册新用户</button></form><a class="secondary-button inline-button" href="/">返回登录</a></section></main>`);
 }
 
 async function adminPage(request: Request, env: Env, message = ""): Promise<Response> {
@@ -1674,8 +1950,11 @@ function requestPath(request: Request, env: Env, account?: WebdavAccount): strin
   const accountPrefix = account ? `${account.owner}/${account.uuid}` : "";
   if (accountPrefix && (relative === accountPrefix || relative.startsWith(`${accountPrefix}/`))) relative = relative.slice(accountPrefix.length).replace(/^\/+/, "");
   const segments = relative ? relative.split("/") : [];
-  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash")) throw new Error("invalid path");
-  return segments.join("/");
+  // NFC 规范化 + 控制字符拒绝：与 adminPath 保持一致，避免跨平台文件名规范不一致与不可见字符注入
+  const normalized = relative.normalize("NFC");
+  const normalizedSegments = normalized ? normalized.split("/") : [];
+  if (normalizedSegments.some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash" || /[\u0000-\u001f\u007f-\u009f]/.test(segment))) throw new Error("invalid path");
+  return normalizedSegments.join("/");
 }
 
 function destinationPath(request: Request, env: Env, account?: WebdavAccount): string {
@@ -1783,7 +2062,11 @@ async function getObject(env: Env, path: string, head: boolean, request: Request
   const object = range
     ? await env.WEBDAV_BUCKET.get(r2Key(path), { range: { offset: range.start, length: range.end - range.start + 1 } })
     : await env.WEBDAV_BUCKET.get(r2Key(path));
-  if (!object) return textResponse("Not Found", 404);
+  if (!object) {
+    // 目录集合不可下载：返回 405 并列出可用方法（RFC 4918 未定义集合 GET，主流服务器均拒绝）
+    if (path && await env.WEBDAV_KV.get(dirKey(path))) return textResponse("Cannot GET a collection", 405, { Allow: "OPTIONS, PROPFIND, HEAD" });
+    return textResponse("Not Found", 404);
+  }
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("ETag", object.httpEtag);
@@ -1998,6 +2281,9 @@ async function putObject(request: Request, env: Env, path: string, account: Webd
   if (lockResponse) return lockResponse;
   const contentLength = Number(request.headers.get("Content-Length"));
   if (!Number.isSafeInteger(contentLength) || contentLength < 0) return textResponse("Content-Length is required", 411);
+  // 单次上传上限（MAX_UPLOAD_BYTES）：提前拦截并给出友好提示，避免平台层报错难排查
+  const maxUploadBytes = getMaxUploadBytes(rootEnv);
+  if (maxUploadBytes > 0 && contentLength > maxUploadBytes) return textResponse(`上传内容超过单次上限（${formatBytes(maxUploadBytes)}），请分块或压缩后重试`, 413, { "X-Upload-Limit": String(maxUploadBytes) });
   const quotaResponse = await ensureStorageCapacity(rootEnv, env, account, path, contentLength);
   if (quotaResponse) return quotaResponse;
   const contentType = request.headers.get("Content-Type") ?? "application/octet-stream";
@@ -2005,17 +2291,21 @@ async function putObject(request: Request, env: Env, path: string, account: Webd
   const metadata: FileMeta = { type: "file", size: object.size, etag: object.httpEtag, contentType, updatedAt: new Date().toISOString() };
   await env.WEBDAV_KV.put(metaKey(path), JSON.stringify(metadata));
   await adjustAccountStorageUsage(env, object.size - (existingObject?.size ?? 0));
+  await recordSyncChange(env, path, "modified");
   return new Response(null, { status: 201, headers: { ETag: object.httpEtag } });
 }
 
 async function makeCollection(env: Env, path: string, request?: Request): Promise<Response> {
   if (!path) return textResponse("The root collection already exists", 405);
   if (request) {
+    // RFC 4918 §9.3.3：MKCOL 携带请求体时返回 415（不支持扩展创建语义）
+    if (Number(request.headers.get("Content-Length") || "0") > 0) return textResponse("MKCOL with a request body is not supported", 415);
     const lockResponse = await assertUnlocked(env, path, request, true);
     if (lockResponse) return lockResponse;
   }
   if (await env.WEBDAV_KV.get(dirKey(path)) || await env.WEBDAV_BUCKET.head(r2Key(path))) return textResponse("Collection already exists", 405);
   await env.WEBDAV_KV.put(dirKey(path), new Date().toISOString());
+  await recordSyncChange(env, path, "modified");
   return new Response(null, { status: 201 });
 }
 
@@ -2057,6 +2347,7 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     await env.WEBDAV_KV.delete(metaKey(path));
     await env.WEBDAV_KV.delete(propKey(path));
     await adjustAccountStorageUsage(env, -object.size);
+    await recordSyncChange(env, path, "deleted");
 
     // 记录删除信息到 KV（用于管理界面显示，30 天过期）
     await env.WEBDAV_KV.put(versionKey, JSON.stringify(trashMeta), {
@@ -2105,6 +2396,9 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     fileCount: objects.length,
   }), { expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60 });
   await adjustAccountStorageUsage(env, -removedBytes);
+  // sync-collection：目录自身与全部子成员记为已删除（子成员仅记录前 100 条，避免大量 KV 写入）
+  await recordSyncChange(env, path, "deleted");
+  for (const item of objects.slice(0, 100)) await recordSyncChange(env, item.key, "deleted");
 
   return new Response(null, { status: 204 });
 }
@@ -2263,6 +2557,8 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
     }
     // 覆盖写入目标：copy 净增源大小减去被覆盖目标；move 时源随后被移除，净减被覆盖目标
     await adjustAccountStorageUsage(env, move ? -(destinationObject?.size ?? 0) : sourceObject.size - (destinationObject?.size ?? 0));
+    if (move) await recordSyncChange(env, source, "deleted");
+    await recordSyncChange(env, destination, "modified");
     return new Response(null, { status: 201 });
   }
   if (!(await hasChildren(env, source)) && !(await env.WEBDAV_KV.get(dirKey(source)))) return textResponse("Not Found", 404);
@@ -2288,6 +2584,7 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
   // 目录复制净增源目录字节数；move 时下方 deletePath 已扣除源目录，两者相抵
   await adjustAccountStorageUsage(env, sourceDirBytes);
   await env.WEBDAV_KV.put(dirKey(destination), new Date().toISOString());
+  await recordSyncChange(env, destination, "modified");
   return new Response(null, { status: 201 });
 }
 
@@ -2333,6 +2630,8 @@ async function moveEntryTo(env: Env, source: string, targetDir: string): Promise
       await env.WEBDAV_BUCKET.delete(objects.slice(index, index + 1000).map((item) => item.key));
     }
     await deleteMetadataUnder(env, source);
+    // sync-collection：源目录的子成员记为已删除（仅记录前 100 条，避免大量 KV 写入）
+    for (const item of objects.slice(0, 100)) await recordSyncChange(env, item.key, "deleted");
   } else {
     const content = await env.WEBDAV_BUCKET.get(r2Key(source));
     if (!content) return "missing";
@@ -2345,6 +2644,9 @@ async function moveEntryTo(env: Env, source: string, targetDir: string): Promise
 
   // 目标父链目录标记不存在时补建，保证移动后可正常浏览
   await ensureDirectoryMarkers(env, [destination]);
+  // sync-collection：目标记为新增/修改，源记为已删除
+  await recordSyncChange(env, destination, "modified");
+  await recordSyncChange(env, source, "deleted");
   return "moved";
 }
 
@@ -2399,6 +2701,8 @@ async function propfind(request: Request, env: Env, path: string, account?: Webd
 async function propResponse(request: Request, env: Env, path: string, directory: boolean, account?: WebdavAccount, quotaXml = "", lockMap: Map<string, LockInfo[]> = new Map(), deadPropsXml = ""): Promise<string> {
   const object = directory ? null : await env.WEBDAV_BUCKET.head(r2Key(path));
   const displayName = path ? path.slice(path.lastIndexOf("/") + 1) : "WebDAV";
+  // creationdate：目录取 dir: 标记的创建时间，文件取 R2 上传时间（RFC 4918 定义为资源创建时刻）
+  const created = directory ? (await env.WEBDAV_KV.get(dirKey(path)) || new Date().toISOString()) : (object?.uploaded?.toISOString() ?? new Date().toISOString());
   const href = `${new URL(request.url).origin}${urlPath(env, path, account)}${directory ? "/" : ""}`;
   const size = object?.size ?? 0;
   const modified = object?.uploaded?.toUTCString() ?? new Date().toUTCString();
@@ -2409,7 +2713,7 @@ async function propResponse(request: Request, env: Env, path: string, directory:
     else if (path.startsWith(`${lockedPath}/`)) applicableLocks.push(...locks.filter((lock) => lock.depth === "infinity"));
   }
   const lockXml = applicableLocks.map((lock) => activeLockXml(lock, href)).join("");
-  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}${quotaXml}${SUPPORTEDLOCK_XML}${lockXml ? `<d:lockdiscovery>${lockXml}</d:lockdiscovery>` : ""}${deadPropsXml}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+  return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop><d:displayname>${escapeXml(displayName)}</d:displayname><d:creationdate>${created}</d:creationdate><d:resourcetype>${directory ? "<d:collection/>" : ""}</d:resourcetype><d:getcontentlength>${size}</d:getcontentlength><d:getlastmodified>${modified}</d:getlastmodified><d:getcontenttype>${directory ? "httpd/unix-directory" : escapeXml(object?.httpMetadata?.contentType ?? "application/octet-stream")}</d:getcontenttype>${object?.httpEtag ? `<d:getetag>${escapeXml(object.httpEtag)}</d:getetag>` : ""}${quotaXml}${SUPPORTEDLOCK_XML}${lockXml ? `<d:lockdiscovery>${lockXml}</d:lockdiscovery>` : ""}${deadPropsXml}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
 }
 
 interface DeadProperty {
@@ -2454,6 +2758,62 @@ async function proppatch(request: Request, env: Env, path: string, account?: Web
   const listed = [...new Set([...removes, ...sets.map((item) => item.name)])].map((name) => `<${escapeXml(name)}/>`).join("");
   const href = `${new URL(request.url).origin}${urlPath(env, path, account)}`;
   return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop>${listed}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", "Cache-Control": "no-store" } });
+}
+
+// —— RFC 6578 sync-collection REPORT：按 sync-token 返回增量变更（新增/修改 200，删除 404）——
+async function reportMethod(request: Request, env: Env, path: string, account?: WebdavAccount): Promise<Response> {
+  const body = await request.text();
+  if (!body) return textResponse("Bad Request", 400);
+  if (!/sync-collection/i.test(body)) return textResponse("Unsupported REPORT type", 422);
+  const tokenMatch = body.match(/<(?:[\w.-]+:)?sync-token[^>]*>([^<]*)</i);
+  const rawToken = (tokenMatch?.[1] ?? "").trim();
+  // token 支持纯数字或 URI 形式（取末段数字）；缺失/非法按 0 处理即首次全量同步
+  const tokenNumber = Number(rawToken.split("/").pop());
+  const token = Number.isFinite(tokenNumber) ? tokenNumber : 0;
+  const state = await readSyncState(env);
+  const changed = Object.entries(state.changes).filter(([, change]) => change.seq > token).sort((a, b) => a[1].seq - b[1].seq);
+  const limit = 500;
+  const truncated = changed.length > limit;
+  const responses = (await Promise.all(changed.slice(0, limit).map(async ([entryPath, change]) => {
+    const deleted = change.kind === "deleted";
+    const href = `${new URL(request.url).origin}${urlPath(env, entryPath, account)}`;
+    const statusLine = deleted ? "HTTP/1.1 404 Not Found" : "HTTP/1.1 200 OK";
+    const propXml = deleted ? "" : (await propResponse(request, env, entryPath, false, account)).match(/<d:propstat><d:prop>([\s\S]*?)<\/d:prop>/)?.[1] ?? "";
+    return `<d:response><d:href>${escapeXml(href)}</d:href><d:propstat><d:prop>${propXml}</d:prop><d:status>${statusLine}</d:status></d:propstat></d:response>`;
+  }))).join("");
+  const limitXml = truncated ? `<d:limit><d:nresults>${limit}</d:nresults></d:limit>` : "";
+  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${responses}${limitXml}<d:sync-token>https://cf-webdav/sync/${state.seq}</d:sync-token></d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1, 2", "Cache-Control": "no-store" } });
+}
+
+// —— RFC 5323 SEARCH：轻量文件名匹配（支持 SQL 式 LIKE '%kw%' 或引号关键词），结果上限 200 ——
+async function searchMethod(request: Request, env: Env, path: string, account?: WebdavAccount): Promise<Response> {
+  const body = await request.text();
+  // 关键词来源优先级：SQL 风格 like '%kw%' -> RFC 5323 <d:like> 内的 <d:literal> -> 单独 <d:literal> -> 引号关键词（最后才考虑，避免误抓 XML 属性值）
+  const sqlLike = body.match(/like\s+'%([^%']*)%'/i) ?? body.match(/like\s+"%([^%"]*)%"/i);
+  const likeLiteral = body.match(/<(?:[\w-]+:)?like[^>]*>[\s\S]*?<(?:[\w-]+:)?literal>([^<]*)<\/(?:[\w-]+:)?literal>/i);
+  const literal = likeLiteral ? null : body.match(/<(?:[\w-]+:)?literal>([^<]*)<\/(?:[\w-]+:)?literal>/i);
+  const quoted = literal ? null : body.includes("<") ? null : body.match(/'([^']{1,64})'/) ?? body.match(/"([^"]{1,64})"/);
+  const keyword = (sqlLike?.[1] ?? likeLiteral?.[1] ?? literal?.[1] ?? quoted?.[1] ?? "").replace(/^%+|%+$/g, "").trim().toLowerCase();
+  if (!keyword) return textResponse("Bad Request: no search keyword found", 400);
+  const base = path ? `${path}/` : "";
+  const matches: Array<{ path: string; directory: boolean }> = [];
+  for (const object of await listAllObjects(env, base)) {
+    if (object.key.startsWith("__trash/")) continue;
+    if (object.key.slice(object.key.lastIndexOf("/") + 1).toLowerCase().includes(keyword)) matches.push({ path: object.key, directory: false });
+    if (matches.length >= 200) break;
+  }
+  if (matches.length < 200) {
+    for (const key of await listAllKV(env, DIR_PREFIX)) {
+      const directory = decodeURIComponent(key.slice(DIR_PREFIX.length));
+      if ((base && !directory.startsWith(base)) || directory.split("/").includes("__trash")) continue;
+      if (directory.slice(directory.lastIndexOf("/") + 1).toLowerCase().includes(keyword)) {
+        matches.push({ path: directory, directory: true });
+        if (matches.length >= 200) break;
+      }
+    }
+  }
+  const xml = (await Promise.all(matches.map((entry) => propResponse(request, env, entry.path, entry.directory, account)))).join("");
+  return new Response(`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${xml}</d:multistatus>`, { status: 207, headers: { "Content-Type": "text/xml; charset=utf-8", DAV: "1, 2", "Cache-Control": "no-store" } });
 }
 
 function urlPath(env: Env, path: string, account?: WebdavAccount): string {
@@ -2697,8 +3057,28 @@ async function adminLogsPage(request: Request, env: Env, filterUsers: string[] =
   const hiddenInputs = Object.entries(hiddenFields).map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`).join("");
   const hiddenQuery = new URLSearchParams(hiddenFields).toString();
   const filterForm = `<section class="logs-filter"><form method="get" action="${escapeHtml(formAction)}" class="logs-filter-form">${hiddenInputs}<select name="f_method" aria-label="按方法筛选"><option value="">全部方法</option>${LOG_METHODS.map((method) => `<option value="${method}"${method === filterMethod ? " selected" : ""}>${method}</option>`).join("")}</select><select name="f_status" aria-label="按状态筛选"><option value="">全部状态</option>${[2, 3, 4, 5].map((status) => `<option value="${status}"${status === filterStatus ? " selected" : ""}>${status}xx</option>`).join("")}</select><input name="f_user" placeholder="用户" value="${escapeHtml(params.get("f_user") || "")}"><input name="f_ip" placeholder="IP" value="${escapeHtml(params.get("f_ip") || "")}"><input name="f_path" placeholder="路径包含" value="${escapeHtml(params.get("f_path") || "")}"><button class="secondary-button" type="submit">筛选</button>${hasFilter ? `<a class="text-link" href="${escapeHtml(formAction)}${hiddenQuery ? `?${hiddenQuery}` : ""}">清除筛选</a>` : ""}</form></section>`;
-  const logSummary = hasFilter ? `筛选后 ${visibleLogs.length} 条（原始 ${accountScopedLogs.length} 条，保留 ${LOG_RETENTION_DAYS} 天）` : `最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）`;
+  const retentionDays = getLogRetentionDays(env);
+  const logSummary = hasFilter ? `筛选后 ${visibleLogs.length} 条（原始 ${accountScopedLogs.length} 条，保留 ${retentionDays} 天）` : `最近 ${recentLogs.length} 条记录（保留 ${retentionDays} 天）`;
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><body>${topbarHtml("访问日志", `<a class="text-link inverse" href="/">返回管理中心</a>`)}<main class="dashboard">${pageHeadingHtml("ACCESS LOG", "访问日志", logSummary)}${filterForm}<section class="data-table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || `<tr><td colspan="7">${hasFilter ? "没有符合条件的日志" : "暂无日志"}</td></tr>`}</tbody></table></section></main></body></html>`);
+}
+
+// 审计日志页：敏感操作流水（登录、改密、TOTP/白名单变更、账户增删、配额调整），仅超级管理员可见，支持筛选与 CSV 导出
+async function adminAuditPage(env: Env, url: URL): Promise<Response> {
+  const params = url.searchParams;
+  const filterActor = (params.get("f_actor") || "").trim().toLowerCase();
+  const filterAction = (params.get("f_action") || "").trim().toLowerCase();
+  const allLogs = await listAuditLogs(env);
+  const visibleLogs = allLogs.filter((log) => (!filterActor || (log.actor || "").toLowerCase().includes(filterActor)) && (!filterAction || (log.action || "").toLowerCase().includes(filterAction)));
+  const rows = visibleLogs.slice(0, 200).map((log) => `<tr><td>${formatDateTime(new Date(log.timestamp))}</td><td>${escapeXml(log.actor || "-")}</td><td>${escapeXml(log.action)}</td><td class="path">${escapeXml(log.target || "-")}</td><td>${escapeXml(log.clientIp || "-")}</td><td class="path">${escapeXml(log.detail || "")}</td></tr>`).join("");
+  const filterForm = `<section class="logs-filter"><form method="get" action="/?view=audit" class="logs-filter-form"><input name="f_actor" placeholder="操作者" value="${escapeHtml(params.get("f_actor") || "")}"><input name="f_action" placeholder="动作" value="${escapeHtml(params.get("f_action") || "")}"><button class="secondary-button" type="submit">筛选</button>${filterActor || filterAction ? `<a class="text-link" href="/?view=audit">清除筛选</a>` : ""}<a class="text-link" href="/?view=audit&export=csv">导出 CSV</a></form></section>`;
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>审计日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><body>${topbarHtml("审计日志", `<a class="text-link inverse" href="/">返回管理中心</a>`)}<main class="dashboard">${pageHeadingHtml("AUDIT LOG", "审计日志", `共 ${visibleLogs.length} 条敏感操作记录（保留 ${AUDIT_RETENTION_DAYS} 天，展示前 200 条）`)}${filterForm}<section class="data-table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th>IP</th><th>详情</th></tr></thead><tbody>${rows || `<tr><td colspan="6">暂无审计记录</td></tr>`}</tbody></table></section></main></body></html>`);
+}
+
+async function auditCsvResponse(env: Env): Promise<Response> {
+  const logs = await listAuditLogs(env);
+  const header = "timestamp,actor,action,target,clientIp,detail";
+  const rows = logs.map((log) => [log.timestamp, log.actor, log.action, log.target, log.clientIp, log.detail ?? ""].map((value) => `"${String(value).replace(/"/g, '""')}"`).join(","));
+  return new Response([header, ...rows].join("\n"), { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="audit-log-${new Date().toISOString().slice(0, 10)}.csv"`, "Cache-Control": "no-store" } });
 }
 
 function formatBytes(bytes: number): string {
