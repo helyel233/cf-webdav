@@ -39,6 +39,8 @@ const SESSION_PREFIX = "session:";
 const LOG_PREFIX = "log:";
 const TRASH_PREFIX = "trash:";
 const LOCK_PREFIX = "davlock:";
+// 分享链接存全局 KV（路由层无账户上下文，记录内含 storageScope），定时任务负责过期清理
+const SHARE_PREFIX = "share:";
 const LOCK_DEFAULT_TIMEOUT = 600;
 const LOCK_MAX_TIMEOUT = 3600;
 const DEFAULT_USERNAME = "admin";
@@ -70,6 +72,7 @@ export default {
     const contentLength = parseInt(request.headers.get("Content-Length") || "0");
     if (pathname === "/" && (request.method === "GET" || request.method === "POST")) return adminRequest(request, env);
     if (pathname === "/__admin" || pathname.startsWith("/__admin/")) return adminRequest(request, env);
+    if (pathname === "/s" || pathname.startsWith("/s/")) return serveShare(request, env);
     if (request.method === "OPTIONS") return optionsResponse();
     let username = "anonymous";
     const webdavAccount = await authenticate(request, env);
@@ -179,6 +182,8 @@ interface WebdavAccount extends Credentials {
   owner: string;
   url: string;
   uuid?: string;
+  // 单账户容量配额（字节），0/缺省 = 不限制（仅受用户级总上限约束）
+  quotaBytes?: number;
 }
 
 async function getWebdavCredentials(env: Env): Promise<Credentials> {
@@ -376,7 +381,13 @@ function createScopedEnv(env: Env, scope: string): Env {
   });
   const scopedBucket = new Proxy(env.WEBDAV_BUCKET, {
     get(target, property, receiver) {
-      if (["get", "put", "head", "delete"].includes(String(property))) return (...args: unknown[]) => (target[property as "get" | "put" | "head" | "delete"] as Function).call(target, `${scope}/r2/${args[0]}`, ...args.slice(1));
+      if (["get", "put", "head", "delete"].includes(String(property))) return (...args: unknown[]) => {
+        // delete 支持键名数组批量删除：需对数组每个元素分别加前缀，否则整组会被拼成一个非法键名
+        if (property === "delete" && Array.isArray(args[0])) {
+          return (target.delete as Function).call(target, (args[0] as string[]).map((key) => `${scope}/r2/${key}`), ...args.slice(1));
+        }
+        return (target[property as "get" | "put" | "head" | "delete"] as Function).call(target, `${scope}/r2/${args[0]}`, ...args.slice(1));
+      };
       if (property === "list") return async (options: { prefix?: string; [key: string]: unknown } = {}) => {
         const base = `${scope}/r2/`;
         const result = await target.list({ ...options, prefix: `${base}${options.prefix || ""}` });
@@ -487,6 +498,12 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     }
   }
   if (request.method === "POST" && (isRoot || url.pathname === "/__admin")) {
+    // 流式上传：必须在 formData 解析前拦截（formData 会整体缓冲请求体），请求体直接管道到 R2
+    if (url.searchParams.get("action") === "upload-stream") {
+      const uploadAccount = (await getWebdavAccounts(env))[String(url.searchParams.get("account") || "")];
+      if (!uploadAccount || uploadAccount.owner !== sessionUser_) return textResponse("请选择有权访问的 WebDAV 账户", 403);
+      return adminUploadStream(request, env, uploadAccount, url);
+    }
     const form = await request.formData();
     const action = String(form.get("action") || "");
     const adminUsername = sessionUser_;
@@ -548,6 +565,9 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       };
       if (!/^\d{6}$/.test(service.uuid)) return await adminPage(request, env, "UUID 必须是 6 位数字");
       if (service.password.length < 8) return await adminPage(request, env, "WebDAV 密码至少需要 8 位");
+      // 单账户配额（GB，0 = 不限制）；超出用户级总上限的设置无意义，直接拒绝
+      const quotaGb = Number(form.get("quotaGb") || "0");
+      if (!Number.isFinite(quotaGb) || quotaGb < 0 || quotaGb > USER_STORAGE_LIMIT / 1024 ** 3) return await adminPage(request, env, "配额必须介于 0（不限制）与 10 GB 之间");
       const saveError = await mutateAccountTable<WebdavAccount>(env, WEBDAV_ACCOUNTS_KEY, () => getWebdavAccounts(env), async (accounts) => {
         if (Object.values(accounts).some((item) => item.uuid === service.uuid && item.username !== accountUsername)) return "UUID 已存在，请换一个";
         const target = accounts[accountUsername];
@@ -557,6 +577,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         target.salt = salt;
         target.passwordHash = await hashPassword(service.password, salt);
         target.url = webdavAccountUrl(request, target);
+        target.quotaBytes = quotaGb > 0 ? Math.round(quotaGb * 1024 ** 3) : 0;
         return null;
       });
       return saveError ? await adminPage(request, env, saveError) : await adminPage(request, env, "服务连接信息已保存");
@@ -578,7 +599,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
       return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
-    if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move"].includes(action)) {
+    if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move", "create-share", "revoke-share"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       return adminFilesAction(request, env, form, sessionUser_, selected.username, selected);
@@ -632,7 +653,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (selectedAccount && selectedAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
   if (view === "account") return selectedAccount ? adminAccountPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "logs") return adminLogsPage(env, [sessionUser_, ...ownedAccountList.map((account) => account.username)]);
-  if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
+  if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount, env) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "accounts") return adminPage(request, env);
   if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
@@ -763,7 +784,7 @@ async function adminAccountPage(request: Request, env: Env, account: WebdavAccou
   const scopedEnv = createScopedEnv(env, storageScope(account));
   const fileCount = (await listAllObjects(scopedEnv, "")).filter((item) => !item.key.startsWith("__trash/")).length;
   const accountUrl = webdavAccountUrl(request, account);
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(account.username)} - WebDAV 管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账户管理", `<a class="text-link inverse" href="/">返回账户选择</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("WEBDAV ACCOUNT", account.username, `当前账户包含 ${fileCount} 个文件，仅显示此账户的数据。`)}<section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">CONNECTION</p><h2>账户连接信息</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">服务链接：${escapeHtml(accountUrl)}</p><form method="post" action="/?view=account&account=${encodeURIComponent(account.username)}" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" autocomplete="username" readonly title="账户名是存储路径标识，不可修改"></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" placeholder="输入新密码" required></label><label>6 位 UUID<input name="accountUuid" value="${escapeHtml(account.uuid || "")}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button class="primary-button" type="submit">保存账户信息</button></form><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></article></section></main></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(account.username)} - WebDAV 管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("账户管理", `<a class="text-link inverse" href="/">返回账户选择</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("WEBDAV ACCOUNT", account.username, `当前账户包含 ${fileCount} 个文件，仅显示此账户的数据。`)}<section class="content-grid"><article class="config-card wide-card"><div class="card-heading"><div><p class="eyebrow">CONNECTION</p><h2>账户连接信息</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">服务链接：${escapeHtml(accountUrl)}</p><form method="post" action="/?view=account&account=${encodeURIComponent(account.username)}" class="config-form"><input type="hidden" name="action" value="save-service"><input type="hidden" name="accountUsername" value="${escapeHtml(account.username)}"><label>账户<input name="serviceUsername" value="${escapeHtml(account.username)}" autocomplete="username" readonly title="账户名是存储路径标识，不可修改"></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" placeholder="输入新密码" required></label><label>6 位 UUID<input name="accountUuid" value="${escapeHtml(account.uuid || "")}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><label>存储配额（GB，0 表示不限制）<input name="quotaGb" type="number" min="0" max="10" step="0.1" value="${account.quotaBytes ? (account.quotaBytes / 1024 ** 3).toString() : "0"}"></label><button class="primary-button" type="submit">保存账户信息</button></form><a class="secondary-button inline-button" href="/?view=files&account=${encodeURIComponent(account.username)}">打开此账户文件</a></article></section></main></body></html>`);
 }
 
 async function adminAccountsPage(request: Request, env: Env, adminUsername: string): Promise<Response> {
@@ -877,6 +898,27 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
         }
       }
       return filesPageRedirect(accountUsername, currentPath, `&moved=${movedCount}&skipped=${skippedCount}&missing=${missingCount}&failed=${failedCount}`);
+    } else if (action === "create-share") {
+      // 创建限时分享链接：仅限已存在的文件；记录存全局 KV（/s/ 路由无账户上下文），TTL 到期自动失效
+      const sharePath = adminPath(String(form.get("path") || ""));
+      operationPath = sharePath;
+      operationMethod = "SHARE";
+      const hours = Number(form.get("expiresIn") || "24");
+      if (![1, 24, 168, 720].includes(hours)) return textResponse("分享有效期不合法", 400);
+      const shareObject = await scopedEnv.WEBDAV_BUCKET.head(r2Key(sharePath));
+      if (!shareObject) return textResponse("仅支持分享已存在的文件", 404);
+      const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(24)));
+      const shareRecord = { scope: storageScope(account), path: sharePath, name: sharePath.slice(sharePath.lastIndexOf("/") + 1), account: accountUsername, owner: username, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + hours * 3600 * 1000).toISOString() };
+      await env.WEBDAV_KV.put(`${SHARE_PREFIX}${token}`, JSON.stringify(shareRecord), { expirationTtl: Math.max(60, Math.round(hours * 3600)) });
+      await logAccess(env, { method: "SHARE", path: sharePath, status: 201, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
+      return filesPageRedirect(accountUsername, currentPath, `&shared=${encodeURIComponent(token)}&sharedExpires=${encodeURIComponent(shareRecord.expiresAt)}`);
+    } else if (action === "revoke-share") {
+      const token = String(form.get("token") || "").replace(/[^A-Za-z0-9_-]/g, "");
+      operationMethod = "SHARE";
+      operationPath = currentPath;
+      const revokeRecord = token ? await env.WEBDAV_KV.get(`${SHARE_PREFIX}${token}`, "json") as { owner?: string } | null : null;
+      if (revokeRecord && revokeRecord.owner === username) await env.WEBDAV_KV.delete(`${SHARE_PREFIX}${token}`);
+      return filesPageRedirect(accountUsername, currentPath, "&shareRevoked=1");
     }
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
@@ -885,7 +927,57 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
   return new Response(null, { status: 303, headers: { Location: `/?view=files&account=${encodeURIComponent(accountUsername)}${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}` } });
 }
 
-async function adminFilesPage(request: Request, env: Env, accountUsername: string): Promise<Response> {
+// 管理界面流式上传：请求体不经 formData 缓冲，直接管道到 R2，支持大文件与浏览器端进度条
+async function adminUploadStream(request: Request, env: Env, account: WebdavAccount, url: URL): Promise<Response> {
+  const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
+  const userAgent = request.headers.get("User-Agent") || "";
+  const filename = url.searchParams.get("name") || "";
+  if (!filename || filename.includes("/") || filename.includes("\\") || filename.includes("..")) return textResponse("文件名不合法", 400);
+  let currentPath = "";
+  try {
+    currentPath = adminPath(url.searchParams.get("path") || "");
+  } catch {
+    return textResponse("非法路径", 400);
+  }
+  const scopedEnv = createScopedEnv(env, storageScope(account));
+  const path = adminPath(`${currentPath ? `${currentPath}/` : ""}${filename}`);
+  const contentLength = Number(request.headers.get("Content-Length"));
+  if (!Number.isSafeInteger(contentLength) || contentLength <= 0) return textResponse("Content-Length 缺失", 411);
+  const quotaResponse = await ensureStorageCapacity(env, scopedEnv, account, path, contentLength);
+  if (quotaResponse) return quotaResponse;
+  const existingObject = await scopedEnv.WEBDAV_BUCKET.head(r2Key(path));
+  const contentType = request.headers.get("Content-Type") || "application/octet-stream";
+  await scopedEnv.WEBDAV_BUCKET.put(r2Key(path), request.body, { httpMetadata: { contentType } });
+  await scopedEnv.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: contentLength, contentType, updatedAt: new Date().toISOString() }));
+  await adjustAccountStorageUsage(scopedEnv, contentLength - (existingObject?.size ?? 0));
+  await logAccess(env, { method: "PUT", path, status: 201, clientIp, userAgent, user: account.owner });
+  return textResponse("OK", 201);
+}
+
+// 公开分享下载：/s/{token}，记录存全局 KV（含 storageScope）；过期/取消/文件删除后失效
+async function serveShare(request: Request, env: Env): Promise<Response> {
+  const token = decodeURIComponent(new URL(request.url).pathname.slice(3));
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(token)) return textResponse("分享链接无效", 404);
+  const record = await env.WEBDAV_KV.get(`${SHARE_PREFIX}${token}`, "json") as { scope: string; path: string; name: string; account: string; expiresAt: string } | null;
+  if (!record) return textResponse("分享链接不存在或已被取消", 404);
+  if (Date.parse(record.expiresAt) <= Date.now()) {
+    await env.WEBDAV_KV.delete(`${SHARE_PREFIX}${token}`);
+    return textResponse("分享链接已过期", 410);
+  }
+  const scopedEnv = createScopedEnv(env, record.scope);
+  const object = await scopedEnv.WEBDAV_BUCKET.get(r2Key(record.path));
+  if (!object) return textResponse("文件不存在或已被删除", 404);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Content-Length", String(object.size));
+  headers.set("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(record.name)}`);
+  headers.set("Cache-Control", "no-store");
+  await logAccess(env, { method: "SHARE", path: record.path, status: 200, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: record.account });
+  return new Response(object.body, { status: 200, headers });
+}
+
+async function adminFilesPage(request: Request, env: Env, account: WebdavAccount, rootEnv: Env): Promise<Response> {
+  const accountUsername = account.username;
   const url = new URL(request.url);
   let currentPath = "";
   try {
@@ -911,10 +1003,62 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
     const child = directory.slice(prefix.length).split("/")[0];
     if (child && child !== "__trash") directorySet.add(`${prefix}${child}`);
   }
-  const directories = [...directorySet].sort();
+  const directories = [...directorySet];
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
   // 当前账户已用存储空间（读取账户作用域用量缓存，缺档时自动全量重建）
   const usedBytes = await getAccountStorageUsage(env);
+  // 搜索 / 排序 / 分页：q 非空时递归搜索当前目录子树（上限 200 条），否则排序后按页切分
+  const query = (url.searchParams.get("q") || "").trim().toLowerCase();
+  const sortKey = ["name", "size", "time"].includes(url.searchParams.get("sort") || "") ? (url.searchParams.get("sort") as "name" | "size" | "time") : "name";
+  const sortOrder = url.searchParams.get("order") === "desc" ? "desc" : "asc";
+  const filesPageSize = 50;
+  let currentPage = Math.max(1, Number(url.searchParams.get("page")) || 1);
+  interface FileEntry { key: string; directory: boolean; size: number; uploaded: string; }
+  const compareEntries = (a: FileEntry, b: FileEntry): number => {
+    const factor = sortOrder === "desc" ? -1 : 1;
+    if (sortKey === "size" && !a.directory && !b.directory) return factor * (a.size - b.size);
+    if (sortKey === "time" && !a.directory && !b.directory) return factor * a.uploaded.localeCompare(b.uploaded);
+    return factor * a.key.slice(prefix.length).localeCompare(b.key.slice(prefix.length), "zh-CN");
+  };
+  let searchCapped = false;
+  let pageEntries: FileEntry[] = [];
+  let totalPages = 1;
+  let totalEntries = 0;
+  if (query) {
+    const matches: FileEntry[] = [];
+    const matchedDirs = new Set<string>();
+    for (const object of await listAllObjects(env, prefix)) {
+      if (object.key.startsWith("__trash/")) continue;
+      const relative = object.key.slice(prefix.length);
+      if (relative.toLowerCase().includes(query)) matches.push({ key: object.key, directory: false, size: object.size, uploaded: object.uploaded.toISOString() });
+      const segments = relative.split("/");
+      segments.pop();
+      let dir = "";
+      for (const segment of segments) {
+        dir = dir ? `${dir}/${segment}` : segment;
+        if (`${prefix}${dir}`.toLowerCase().includes(query)) matchedDirs.add(`${prefix}${dir}`);
+      }
+    }
+    for (const key of await listAllKV(env, DIR_PREFIX)) {
+      const directory = decodeURIComponent(key.slice(DIR_PREFIX.length));
+      if (directory.startsWith(prefix) && directory !== currentPath && directory.toLowerCase().includes(query)) matchedDirs.add(directory);
+    }
+    matches.push(...[...matchedDirs].map((directory) => ({ key: directory, directory: true, size: 0, uploaded: "" })));
+    matches.sort(compareEntries);
+    searchCapped = matches.length > 200;
+    pageEntries = searchCapped ? matches.slice(0, 200) : matches;
+    directories.length = 0;
+    totalEntries = matches.length;
+  } else {
+    const entries: FileEntry[] = [
+      ...directories.map((directory) => ({ key: directory, directory: true, size: 0, uploaded: "" })),
+      ...files.map((file) => ({ key: file.key, directory: false, size: file.size, uploaded: file.uploaded.toISOString() })),
+    ].sort(compareEntries);
+    totalEntries = entries.length;
+    totalPages = Math.max(1, Math.ceil(totalEntries / filesPageSize));
+    currentPage = Math.min(currentPage, totalPages);
+    pageEntries = entries.slice((currentPage - 1) * filesPageSize, currentPage * filesPageSize);
+  }
   // 批量操作结果提示（重定向回跳参数）：仅接受纯数字计数，拒绝任意拼接值以防注入
   const countParam = (value: string | null): number | null => {
     if (value === null || !/^\d+$/.test(value)) return null;
@@ -932,6 +1076,10 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
     const detail = [skippedCount ? `，${skippedCount} 项因目标已存在同名内容被跳过` : "", missingCount ? `，${missingCount} 项已不存在` : "", failedCount ? `，${failedCount} 项处理失败` : ""].filter(Boolean).join("");
     noticeParts.push(`成功移动 ${movedCount} 项${detail}`);
   }
+  const sharedToken = (url.searchParams.get("shared") || "").replace(/[^A-Za-z0-9_-]/g, "");
+  const sharedExpires = url.searchParams.get("sharedExpires") || "";
+  if (sharedToken) noticeParts.push(`分享链接已创建：<a href="/s/${sharedToken}">${escapeHtml(new URL(request.url).origin)}/s/${sharedToken}</a>${sharedExpires ? `（有效期至 ${escapeHtml(sharedExpires)}）` : ""}`);
+  if (url.searchParams.get("shareRevoked") === "1") noticeParts.push("分享链接已取消");
   const batchNotice = noticeParts.length ? `<div class="batch-notice">${noticeParts.join("；")}</div>` : "";
   // 移动目标下拉：收集账户内全部目录（dir: 标记 + R2 对象父链推导），排除 __trash 与当前目录自身及其子目录（移入即冲突）
   const targetDirOptions = new Set<string>(directorySet);
@@ -963,12 +1111,38 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
   }).join("");
   const dirMenuItems = renderDirMenuItems("");
   const batchToolbar = `<form id="files-batch-form" method="post" action="/?view=files" class="batch-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><span class="batch-hint">已选 <b id="batch-count">0</b> 项</span><div class="dir-menu" id="dir-menu"><button type="button" class="batch-target-input" id="dir-menu-button" aria-haspopup="true">根目录</button><input type="hidden" name="targetDir" id="target-dir-input" value=""><div class="dir-menu-panel" id="dir-menu-panel" hidden><div class="dir-menu-item" data-path=""><span class="dir-menu-label">根目录</span></div>${dirMenuItems}</div></div><button class="secondary-button" type="submit" name="action" value="batch-move" onclick="return confirmBatchMove()">移动选中</button><button class="danger-button" type="submit" name="action" value="batch-delete" onclick="return confirmBatchDelete()">删除选中</button></form><script>function checkedFileCount(){return document.querySelectorAll('.file-check:checked').length}function toggleFileSelect(checked){document.querySelectorAll('.file-check').forEach(function(c){c.checked=checked});updateBatchCount()}function updateBatchCount(){var el=document.getElementById('batch-count');if(el)el.textContent=checkedFileCount()}function confirmBatchDelete(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}return confirm('确定删除选中的 '+n+' 项吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')}function confirmBatchMove(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}var t=document.getElementById('target-dir-input').value||'根目录';return confirm('确定将选中的 '+n+' 项移动到「'+t+'」吗？目标已存在同名内容时将跳过。')}document.addEventListener('change',function(e){if(e.target&&e.target.classList&&e.target.classList.contains('file-check'))updateBatchCount()});var mb=document.getElementById('dir-menu-button'),mp=document.getElementById('dir-menu-panel');mb.addEventListener('click',function(e){e.stopPropagation();mp.hidden=!mp.hidden});document.addEventListener('click',function(e){if(!mp.hidden&&!document.getElementById('dir-menu').contains(e.target))mp.hidden=true});mp.addEventListener('click',function(e){if(e.target.classList&&e.target.classList.contains('dir-menu-arrow')){e.stopPropagation();e.target.parentElement.classList.toggle('open');return}var it=e.target.closest?e.target.closest('.dir-menu-item'):null;if(!it)return;document.getElementById('target-dir-input').value=it.getAttribute('data-path');mb.textContent=it.getAttribute('data-path')||'根目录';mp.hidden=true});mp.addEventListener('mouseover',function(e){var it=e.target.closest?e.target.closest('.dir-menu-item'):null;if(!it||!it.classList.contains('has-children'))return;it.classList.toggle('flip-left',it.getBoundingClientRect().right+210>window.innerWidth)})</script>`;
+  // 生效中的分享链接（全局 KV 存储按账户过滤）
+  const activeShares: { token: string; path: string; expiresAt: string }[] = [];
+  for (const key of await listAllKV(rootEnv, SHARE_PREFIX)) {
+    const shareRecord = await rootEnv.WEBDAV_KV.get(key, "json") as { account?: string; path?: string; expiresAt?: string } | null;
+    if (shareRecord && shareRecord.account === accountUsername && shareRecord.expiresAt && Date.parse(shareRecord.expiresAt) > Date.now()) {
+      activeShares.push({ token: key.slice(SHARE_PREFIX.length), path: shareRecord.path || "", expiresAt: shareRecord.expiresAt });
+    }
+  }
+  activeShares.sort((a, b) => a.expiresAt.localeCompare(b.expiresAt));
+  const sharesSection = activeShares.length ? `<section class="file-table-wrap shares-section"><div class="card-heading"><div><p class="eyebrow">ACTIVE SHARES</p><h2>生效中的分享链接</h2></div></div><table><thead><tr><th>文件</th><th>链接</th><th>有效期至</th><th>操作</th></tr></thead><tbody>${activeShares.map((share) => `<tr><td>${escapeHtml(share.path)}</td><td><a href="/s/${share.token}">/s/${share.token}</a></td><td>${formatDateTime(new Date(share.expiresAt))}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确定取消该分享链接吗？')"><input type="hidden" name="action" value="revoke-share"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="hidden" name="token" value="${escapeHtml(share.token)}"><button class="danger-button" type="submit">取消分享</button></form></td></tr>`).join("")}</tbody></table></section>` : "";
+  const origin = new URL(request.url).origin;
+  const pageUrl = (overrides: Record<string, string>): string => {
+    const params = new URLSearchParams({ view: "files", account: accountUsername });
+    if (currentPath) params.set("path", currentPath);
+    if (query) params.set("q", query);
+    if (sortKey !== "name") { params.set("sort", sortKey); params.set("order", sortOrder); }
+    for (const [key, value] of Object.entries(overrides)) params.set(key, value);
+    return `/?${params}`;
+  };
+  const sortLink = (key: "name" | "size" | "time", label: string): string => {
+    const marker = sortKey === key ? (sortOrder === "asc" ? " ▲" : " ▼") : "";
+    const nextOrder = sortKey === key && sortOrder === "asc" ? "desc" : "asc";
+    return `<a class="sort-link" href="${pageUrl({ sort: key, order: nextOrder })}">${label}${marker}</a>`;
+  };
+  const pager = !query && totalPages > 1 ? `<nav class="files-pager">${currentPage > 1 ? `<a class="pager-link" href="${pageUrl({ page: String(currentPage - 1) })}">‹ 上一页</a>` : `<span class="pager-link disabled">‹ 上一页</span>`}<span class="pager-status">第 ${currentPage} / ${totalPages} 页（共 ${totalEntries} 项）</span>${currentPage < totalPages ? `<a class="pager-link" href="${pageUrl({ page: String(currentPage + 1) })}">下一页 ›</a>` : `<span class="pager-link disabled">下一页 ›</span>`}</nav>` : "";
+  const searchHint = query ? `<p class="muted search-hint">${searchCapped ? `匹配项较多，仅显示前 200 条，请细化关键词（共 ${totalEntries} 项匹配）。` : `搜索“${escapeHtml(url.searchParams.get("q") || "")}”，共 ${totalEntries} 项匹配。`}</p>` : "";
+  const shareExpirySelect = `<select name="expiresIn" class="share-expiry" title="有效期"><option value="1">1 小时</option><option value="24" selected>1 天</option><option value="168">7 天</option><option value="720">30 天</option></select>`;
   const rows = [
-    ...(currentPath ? [`<tr><td class="check-col"></td><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
-    ...directories.map((directory) => `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(directory)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(directory)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
-    ...files.map((file) => `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(file.key)}"></td><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(file.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(file.size)}</td><td>${formatDateTime(file.uploaded)}</td><td><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(file.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
+    ...(currentPath && !query ? [`<tr><td class="check-col"></td><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
+    ...pageEntries.map((entry) => entry.directory ? `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(entry.key)}">${escapeHtml(entry.key.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>` : `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(entry.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(entry.size)}</td><td>${formatDateTime(new Date(entry.uploaded))}</td><td><div class="row-actions"><form method="post" action="/?view=files" class="share-form" onsubmit="return confirm('创建该文件的公开分享链接吗？任何人在有效期内都可通过链接下载。')"><input type="hidden" name="action" value="create-share"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}">${shareExpirySelect}<button class="secondary-button" type="submit">分享</button></form><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></div></td></tr>`),
   ].join("");
-    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<div class="files-storage-stack"><div class="storage-badge"><span>当前账户已用空间</span><strong>${formatStorageUsage(usedBytes)}</strong></div><a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a></div>`)}${batchNotice}<section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>选择一个文件上传到当前目录</span></div><form method="post" action="/?view=files" enctype="multipart/form-data"><input type="hidden" name="action" value="upload"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="file" name="file" required><button class="primary-button" type="submit">上传文件</button></form></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th class="check-col"><input type="checkbox" id="files-select-all" onchange="toggleFileSelect(this.checked)" title="全选" aria-label="全选"></th><th>名称</th><th>类型</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="empty-state">当前目录为空</td></tr>'}</tbody></table></section>${batchToolbar}</main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<div class="files-storage-stack"><div class="storage-badge"><span>当前账户已用空间${account.quotaBytes ? " / 配额" : ""}</span><strong>${formatStorageUsage(usedBytes)}${account.quotaBytes ? ` / ${formatStorageUsage(account.quotaBytes)}` : ""}</strong></div><a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a></div>`)}${batchNotice}<section class="files-search"><form method="get" action="/" class="files-search-form"><input type="hidden" name="view" value="files"><input type="hidden" name="account" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(currentPath)}"><input name="q" type="search" placeholder="搜索当前目录及子目录内的文件" value="${escapeHtml(url.searchParams.get("q") || "")}"><button class="secondary-button" type="submit">搜索</button>${query ? `<a class="text-link" href="${pageUrl({ q: "" })}">清除搜索</a>` : ""}</form></section><section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>支持大文件流式上传并显示进度</span></div><div class="upload-row"><input type="file" id="upload-file-input"><button class="primary-button" type="button" onclick="return startUpload()">上传文件</button></div><div class="upload-progress" id="upload-progress" hidden><div id="upload-progress-bar"></div></div><span class="upload-status" id="upload-status"></span></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th class="check-col"><input type="checkbox" id="files-select-all" onchange="toggleFileSelect(this.checked)" title="全选" aria-label="全选"></th><th>${sortLink("name", "名称")}</th><th>类型</th><th>${sortLink("size", "大小")}</th><th>${sortLink("time", "上传时间")}</th><th>操作</th></tr></thead><tbody>${rows || `<tr><td colspan="6" class="empty-state">${query ? "没有匹配的文件" : "当前目录为空"}</td></tr>`}</tbody></table></section>${pager}${batchToolbar}${sharesSection}<script>function startUpload(){var input=document.getElementById('upload-file-input');var file=input.files&&input.files[0];if(!file){alert('请先选择文件');return false}var status=document.getElementById('upload-status'),wrap=document.getElementById('upload-progress'),bar=document.getElementById('upload-progress-bar');wrap.hidden=false;bar.style.width='0%';status.textContent='上传中…';var xhr=new XMLHttpRequest();xhr.open('POST','/?view=files&action=upload-stream&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(currentPath)}&name='+encodeURIComponent(file.name));xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';status.textContent='上传中 '+p+'%'}};xhr.onload=function(){if(xhr.status===201){status.textContent='上传成功，正在刷新…';location.reload()}else{wrap.hidden=true;status.textContent='上传失败：'+(xhr.responseText||('HTTP '+xhr.status))}};xhr.onerror=function(){wrap.hidden=true;status.textContent='上传失败，请重试'};xhr.send(file);return false}</script></main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -1721,7 +1895,9 @@ async function propfind(request: Request, env: Env, path: string, account?: Webd
   let quotaXml = "";
   if (rootIsDirectory) {
     const used = account && rootEnv ? await getUserStorageUsage(rootEnv, account.owner) : await storageSizeAtPath(env, "");
-    const available = Math.max(0, USER_STORAGE_LIMIT - used);
+    let available = Math.max(0, USER_STORAGE_LIMIT - used);
+    // 账户级配额生效时，可用空间取用户级余量与账户级余量的较小者
+    if (account?.quotaBytes && account.quotaBytes > 0) available = Math.min(available, Math.max(0, account.quotaBytes - await getAccountStorageUsage(env)));
     quotaXml = `<d:quota-used-bytes>${used}</d:quota-used-bytes><d:quota-available-bytes>${available}</d:quota-available-bytes>`;
   }
   const entries = [{ path, directory: rootIsDirectory }];
@@ -1757,12 +1933,16 @@ function urlPath(env: Env, path: string, account?: WebdavAccount): string {
 async function listChildren(env: Env, path: string): Promise<Array<{ path: string; directory: boolean }>> {
   const prefix = path ? `${path}/` : "";
   const listed = await env.WEBDAV_BUCKET.list({ prefix, delimiter: "/" });
-  const result = listed.delimitedPrefixes.map((item) => ({ path: item.slice(0, -1), directory: true }));
-  for (const object of listed.objects) result.push({ path: object.key, directory: false });
+  // __trash 为保留命名空间：requestPath 已拒绝访问，列举时同样不可见
+  const result = listed.delimitedPrefixes.filter((item) => !item.slice(0, -1).split("/").includes("__trash")).map((item) => ({ path: item.slice(0, -1), directory: true }));
+  for (const object of listed.objects) {
+    if (object.key.split("/").includes("__trash")) continue;
+    result.push({ path: object.key, directory: false });
+  }
   const dirs = await listAllKV(env, `${DIR_PREFIX}${encodeURIComponent(prefix)}`);
   for (const key of dirs) {
     const child = decodeURIComponent(key.slice((DIR_PREFIX + encodeURIComponent(prefix)).length));
-    if (child && !child.includes("/")) result.push({ path: `${prefix}${child}`, directory: true });
+    if (child && !child.includes("/") && child !== "__trash") result.push({ path: `${prefix}${child}`, directory: true });
   }
   return [...new Map(result.map((entry) => [entry.path, entry])).values()];
 }
@@ -1829,6 +2009,15 @@ async function getUserStorageUsage(env: Env, owner: string): Promise<number> {
 
 async function ensureStorageCapacity(rootEnv: Env, accountEnv: Env, account: WebdavAccount, path: string, incomingSize: number): Promise<Response | null> {
   const currentObject = await accountEnv.WEBDAV_BUCKET.head(r2Key(path));
+  // 账户级配额优先校验：超出返回 507（WebDAV 惯例的 Insufficient Storage）
+  if (account.quotaBytes && account.quotaBytes > 0) {
+    const accountUsage = await getAccountStorageUsage(accountEnv);
+    const projectedAccount = accountUsage - (currentObject?.size || 0) + incomingSize;
+    if (projectedAccount > account.quotaBytes) return textResponse("超出该账户的存储配额", 507, {
+      "X-Account-Quota": String(account.quotaBytes),
+      "X-Account-Used": String(accountUsage),
+    });
+  }
   const currentUsage = await getUserStorageUsage(rootEnv, account.owner);
   const projectedUsage = currentUsage - (currentObject?.size || 0) + incomingSize;
   if (projectedUsage <= USER_STORAGE_LIMIT) return null;
@@ -2072,6 +2261,26 @@ td.check-col{text-align:center}
 .batch-toolbar .secondary-button,.batch-toolbar .danger-button{margin:0;height:40px;min-height:40px;padding:0 16px}
 .files-storage-stack{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
 .files-storage-stack .storage-badge{align-items:flex-end;text-align:right}
+.files-search{margin:0 0 18px}
+.files-search-form{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.files-search-form input[type="search"]{flex:1;min-width:200px;max-width:360px;height:40px;padding:0 12px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit}
+.search-hint{margin:0 0 12px;font-size:13px}
+.sort-link{color:inherit;text-decoration:none}
+.sort-link:hover{color:var(--text-primary)}
+.row-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.share-form{display:flex;align-items:center;gap:6px;margin:0}
+.share-expiry{height:34px;padding:0 6px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit;font-size:13px}
+.upload-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.upload-progress{height:8px;border-radius:4px;background:rgba(127,127,127,.2);margin-top:10px;overflow:hidden}
+.upload-progress #upload-progress-bar{height:100%;width:0;border-radius:4px;background:#3d9368;transition:width .2s}
+.upload-status{display:block;margin-top:6px;font-size:13px;color:var(--text-secondary);min-height:18px}
+.files-pager{display:flex;align-items:center;justify-content:center;gap:16px;margin:16px 0 0;font-size:14px}
+.pager-link{color:var(--text-primary);text-decoration:none;padding:6px 12px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg)}
+.pager-link:hover:not(.disabled){border-color:var(--text-secondary)}
+.pager-link.disabled{opacity:.45;cursor:default}
+.pager-status{color:var(--text-secondary)}
+.shares-section{margin-top:24px}
+.shares-section .card-heading{margin-bottom:12px}
 `;
 
 var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.storage-badge{display:flex;flex-direction:column;gap:5px;padding:12px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow);font-size:13px;color:var(--text-secondary);white-space:nowrap}.storage-badge strong{color:var(--text-primary);font-size:15px;letter-spacing:-.02em}`;
