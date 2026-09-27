@@ -41,6 +41,17 @@ const TRASH_PREFIX = "trash:";
 const LOCK_PREFIX = "davlock:";
 // 分享链接存全局 KV（路由层无账户上下文，记录内含 storageScope），定时任务负责过期清理
 const SHARE_PREFIX = "share:";
+// 每用户每日访问日志写入上限（防异常客户端撑爆日志 KV）；文本预览大小上限
+const MAX_DAILY_LOGS_PER_USER = 2000;
+const PREVIEW_TEXT_LIMIT = 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"]);
+const TEXT_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "xml", "csv", "log", "yaml", "yml", "ini", "js", "css", "html", "htm", "py", "sh", "ts", "toml"]);
+function previewKindOf(name: string): "image" | "text" | null {
+  const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  if (TEXT_EXTENSIONS.has(ext)) return "text";
+  return null;
+}
 const LOCK_DEFAULT_TIMEOUT = 600;
 const LOCK_MAX_TIMEOUT = 3600;
 const DEFAULT_USERNAME = "admin";
@@ -143,9 +154,18 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
     user: log.user,
   };
 
+  // 每用户每日写入上限：超过即丢弃新日志，防止异常客户端在保留期内把日志 KV 撑爆
+  const dailyKey = `loglimit:${accessLog.user || "anonymous"}:${accessLog.timestamp.slice(0, 10)}`;
+  let writtenToday = 0;
+  try { writtenToday = parseInt(await env.WEBDAV_KV.get(dailyKey) || "0"); } catch { }
+  if (writtenToday >= MAX_DAILY_LOGS_PER_USER) {
+    console.warn("Daily access log limit reached, dropping log for user", accessLog.user);
+    return;
+  }
   const logKey = `${LOG_PREFIX}${String(1e13 - Date.now()).padStart(13, "0")}-${Math.random().toString(36).slice(2)}`;
   try {
     await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: LOG_RETENTION_DAYS * 24 * 60 * 60 });
+    await env.WEBDAV_KV.put(dailyKey, String(writtenToday + 1), { expirationTtl: 172800 });
   } catch (error) {
     // 日志写入失败不应影响主请求的响应
     console.error("Failed to write access log", error);
@@ -599,7 +619,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
       return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     }
-    if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move", "create-share", "revoke-share"].includes(action)) {
+    if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move", "create-share", "revoke-share", "copy-file"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
       if (!selected || selected.owner !== adminUsername) return textResponse("请选择有权访问的 WebDAV 账户", 403);
       return adminFilesAction(request, env, form, sessionUser_, selected.username, selected);
@@ -633,11 +653,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       return new Response(null, { status: 303, headers: { Location: `/?view=trash&account=${encodeURIComponent(selected.username)}` } });
     }
   }
+  // 文件在线预览：api=preview 返回原始内容（图片/文本内联，dl=1 下载）；view=preview 渲染预览页
+  if (url.searchParams.get("api") === "preview" && request.method === "GET") {
+    const previewAccount = (await getWebdavAccounts(env))[String(url.searchParams.get("account") || "")];
+    if (!previewAccount || previewAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
+    return servePreviewRaw(request, env, previewAccount, url);
+  }
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
     const ownedNames = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === sessionUser_).map((account) => account.username);
-    return view === "logs" ? adminLogsPage(env, [sessionUser_, ...ownedNames]) : adminPage(request, env);
+    return view === "logs" ? adminLogsPage(request, env, [sessionUser_, ...ownedNames], "/__admin/logs") : adminPage(request, env);
   }
   // 新增：校验新建 WebDAV 账户的 UUID 是否重复
   if (url.searchParams.get("api") === "check-uuid" && request.method === "GET") {
@@ -648,11 +674,12 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ ok: true, available: !uuidDuplicated, message: uuidDuplicated ? "该 UUID 已被占用，请换一个" : "该 UUID 可用" }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
   }
   const ownedAccountList = Object.values(await getWebdavAccounts(env)).filter((account) => account.owner === sessionUser_);
-  const requestedAccount = url.searchParams.get("account") || (view === "account" || view === "files" || view === "logs" || view === "trash" ? ownedAccountList[0]?.username : "");
+  const requestedAccount = url.searchParams.get("account") || (view === "account" || view === "files" || view === "logs" || view === "trash" || view === "preview" ? ownedAccountList[0]?.username : "");
   const selectedAccount = (await getWebdavAccounts(env))[requestedAccount || ""];
   if (selectedAccount && selectedAccount.owner !== sessionUser_) return textResponse("Forbidden", 403);
   if (view === "account") return selectedAccount ? adminAccountPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
-  if (view === "logs") return adminLogsPage(env, [sessionUser_, ...ownedAccountList.map((account) => account.username)]);
+  if (view === "logs") return adminLogsPage(request, env, [sessionUser_, ...ownedAccountList.map((account) => account.username)], "/?", { view: "logs" });
+  if (view === "preview") return selectedAccount ? adminPreviewPage(request, env, selectedAccount) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "files") return selectedAccount ? adminFilesPage(request, createScopedEnv(env, storageScope(selectedAccount)), selectedAccount, env) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "trash") return selectedAccount ? adminTrashPage(createScopedEnv(env, storageScope(selectedAccount)), selectedAccount.username) : adminPage(request, env, "请先选择 WebDAV 账户");
   if (view === "accounts") return adminPage(request, env);
@@ -663,7 +690,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
 async function superAdminRequest(request: Request, env: Env, currentAdmin: AdminAccount): Promise<Response> {
   const url = new URL(request.url);
   // 超级管理员可查看全量访问日志
-  if (request.method === "GET" && url.searchParams.get("view") === "logs") return adminLogsPage(env);
+  if (request.method === "GET" && url.searchParams.get("view") === "logs") return adminLogsPage(request, env, [], "/__admin/logs", { view: "logs" });
   if (request.method !== "POST") return superAdminPage(env, "");
   const form = await request.formData();
   const action = String(form.get("action") || "");
@@ -919,6 +946,28 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       const revokeRecord = token ? await env.WEBDAV_KV.get(`${SHARE_PREFIX}${token}`, "json") as { owner?: string } | null : null;
       if (revokeRecord && revokeRecord.owner === username) await env.WEBDAV_KV.delete(`${SHARE_PREFIX}${token}`);
       return filesPageRedirect(accountUsername, currentPath, "&shareRevoked=1");
+    } else if (action === "copy-file") {
+      // 单文件复制（仅限文件）：副本保存在当前目录下，目标同名即拒绝（覆盖即不可逆丢失），走配额检查并回加用量
+      const sourcePath = adminPath(String(form.get("path") || ""));
+      operationPath = sourcePath;
+      operationMethod = "COPY";
+      const copyName = String(form.get("copyName") || "").trim();
+      if (!copyName || copyName.includes("/") || copyName.includes("\\") || copyName.includes("..")) return textResponse("副本名称不合法", 400);
+      const copyPath = adminPath(`${currentPath ? `${currentPath}/` : ""}${copyName}`);
+      if (copyPath === sourcePath) return textResponse("副本名称不能与原文件相同", 400);
+      const sourceObject = await scopedEnv.WEBDAV_BUCKET.head(r2Key(sourcePath));
+      if (!sourceObject) return textResponse("仅支持复制已存在的文件", 404);
+      if (await scopedEnv.WEBDAV_BUCKET.head(r2Key(copyPath))) return textResponse("目标名称已存在，请换一个名称", 400);
+      const copyQuotaResponse = await ensureStorageCapacity(env, scopedEnv, account, copyPath, sourceObject.size);
+      if (copyQuotaResponse) return copyQuotaResponse;
+      const copyContent = await scopedEnv.WEBDAV_BUCKET.get(r2Key(sourcePath));
+      if (!copyContent) return textResponse("文件不存在或已被删除", 404);
+      await scopedEnv.WEBDAV_BUCKET.put(r2Key(copyPath), copyContent.body, { httpMetadata: copyContent.httpMetadata });
+      const copyMeta = await scopedEnv.WEBDAV_KV.get(metaKey(sourcePath));
+      if (copyMeta) await scopedEnv.WEBDAV_KV.put(metaKey(copyPath), copyMeta);
+      await adjustAccountStorageUsage(scopedEnv, copyContent.size);
+      await logAccess(env, { method: "COPY", path: copyPath, status: 201, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
+      return filesPageRedirect(accountUsername, currentPath, "&copied=1");
     }
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
@@ -974,6 +1023,81 @@ async function serveShare(request: Request, env: Env): Promise<Response> {
   headers.set("Cache-Control", "no-store");
   await logAccess(env, { method: "SHARE", path: record.path, status: 200, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: record.account });
   return new Response(object.body, { status: 200, headers });
+}
+
+// 文件预览原始内容端点：图片/文本内联返回；dl=1 时强制附件下载。
+// CSP sandbox 阻断内嵌脚本（如 SVG 内 <script>），nosniff 禁止类型嗅探，防止同源执行
+async function servePreviewRaw(request: Request, env: Env, account: WebdavAccount, url: URL): Promise<Response> {
+  let path = "";
+  try {
+    path = adminPath(url.searchParams.get("path") || "");
+  } catch {
+    return textResponse("非法路径", 400);
+  }
+  const scopedEnv = createScopedEnv(env, storageScope(account));
+  const object = await scopedEnv.WEBDAV_BUCKET.get(r2Key(path));
+  if (!object) return textResponse("文件不存在或已被删除", 404);
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  if (!headers.get("Content-Type")) headers.set("Content-Type", "application/octet-stream");
+  headers.set("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(name)}`);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Security-Policy", "sandbox");
+  headers.set("Cache-Control", "no-store");
+  // 上传时文本类常被存为 octet-stream，内联预览时按扩展名改为 text/plain，浏览器才能直接展示
+  if (previewKindOf(name) === "text") headers.set("Content-Type", "text/plain; charset=utf-8");
+  if (url.searchParams.get("dl") === "1") {
+    headers.set("Content-Type", "application/octet-stream");
+    headers.set("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+  }
+  headers.set("Content-Length", String(object.size));
+  return new Response(object.body, { status: 200, headers });
+}
+
+// 文件在线预览页：图片直接展示，文本/Markdown 转义后展示，其余类型提示不支持并提供下载
+async function adminPreviewPage(request: Request, env: Env, account: WebdavAccount): Promise<Response> {
+  const url = new URL(request.url);
+  let path = "";
+  try {
+    path = adminPath(url.searchParams.get("path") || "");
+  } catch {
+    return textResponse("非法路径", 400);
+  }
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const kind = previewKindOf(name);
+  const scopedEnv = createScopedEnv(env, storageScope(account));
+  const previewUrl = `/?api=preview&account=${encodeURIComponent(account.username)}&path=${encodeURIComponent(path)}`;
+  let previewBody = "";
+  let sizeBytes = 0;
+  let uploadedAt = "";
+  if (kind === "image") {
+    const object = await scopedEnv.WEBDAV_BUCKET.head(r2Key(path));
+    if (!object) return textResponse("文件不存在或已被删除", 404);
+    sizeBytes = object.size;
+    uploadedAt = object.uploaded.toISOString();
+    previewBody = `<div class="preview-media"><img src="${previewUrl}" alt="${escapeHtml(name)}"></div>`;
+  } else if (kind === "text") {
+    const object = await scopedEnv.WEBDAV_BUCKET.get(r2Key(path));
+    if (!object) return textResponse("文件不存在或已被删除", 404);
+    sizeBytes = object.size;
+    uploadedAt = object.uploaded.toISOString();
+    if (object.size > PREVIEW_TEXT_LIMIT) {
+      previewBody = `<p class="muted">文本文件超过 ${formatBytes(PREVIEW_TEXT_LIMIT)}，暂不支持在线预览，请下载后查看。</p>`;
+    } else {
+      // 文本内容必须转义后展示，防止存储型 XSS
+      previewBody = `<pre class="preview-text">${escapeHtml(await object.text())}</pre>`;
+    }
+  } else {
+    const object = await scopedEnv.WEBDAV_BUCKET.head(r2Key(path));
+    if (!object) return textResponse("文件不存在或已被删除", 404);
+    sizeBytes = object.size;
+    uploadedAt = object.uploaded.toISOString();
+    previewBody = `<p class="muted">该文件类型不支持在线预览，可下载后查看。</p>`;
+  }
+  const parentPath = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  const typeLabel = kind === "image" ? "图片" : kind === "text" ? "文本" : "文件";
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件预览 - ${escapeHtml(name)}</title><style>${ADMIN_CSS}${FILES_CSS}${PREVIEW_CSS}</style><body>${topbarHtml("文件预览", `<a class="text-link inverse" href="/?view=files&account=${encodeURIComponent(account.username)}${parentPath ? `&path=${encodeURIComponent(parentPath)}` : ""}">返回文件管理</a>`)}<main class="dashboard"><section class="file-table-wrap preview-shell"><div class="preview-heading"><div><strong>${escapeHtml(name)}</strong><span class="preview-meta">${typeLabel} · ${formatBytes(sizeBytes)} · ${formatDateTime(new Date(uploadedAt))}</span></div><div class="row-actions"><a class="secondary-button" href="${previewUrl}&dl=1">下载</a></div></div>${previewBody}</section></main></body></html>`);
 }
 
 async function adminFilesPage(request: Request, env: Env, account: WebdavAccount, rootEnv: Env): Promise<Response> {
@@ -1070,6 +1194,7 @@ async function adminFilesPage(request: Request, env: Env, account: WebdavAccount
   const skippedCount = countParam(url.searchParams.get("skipped")) ?? 0;
   const missingCount = countParam(url.searchParams.get("missing")) ?? 0;
   const failedCount = countParam(url.searchParams.get("failed")) ?? 0;
+  const copiedFlag = countParam(url.searchParams.get("copied"));
   const noticeParts: string[] = [];
   if (deletedCount !== null) noticeParts.push(deletedCount ? `成功删除 ${deletedCount} 项，内容已移入回收站` : "未删除任何项（可能已被删除或不存在）");
   if (movedCount !== null) {
@@ -1080,6 +1205,7 @@ async function adminFilesPage(request: Request, env: Env, account: WebdavAccount
   const sharedExpires = url.searchParams.get("sharedExpires") || "";
   if (sharedToken) noticeParts.push(`分享链接已创建：<a href="/s/${sharedToken}">${escapeHtml(new URL(request.url).origin)}/s/${sharedToken}</a>${sharedExpires ? `（有效期至 ${escapeHtml(sharedExpires)}）` : ""}`);
   if (url.searchParams.get("shareRevoked") === "1") noticeParts.push("分享链接已取消");
+  if (copiedFlag) noticeParts.push("文件复制成功");
   const batchNotice = noticeParts.length ? `<div class="batch-notice">${noticeParts.join("；")}</div>` : "";
   // 移动目标下拉：收集账户内全部目录（dir: 标记 + R2 对象父链推导），排除 __trash 与当前目录自身及其子目录（移入即冲突）
   const targetDirOptions = new Set<string>(directorySet);
@@ -1138,11 +1264,18 @@ async function adminFilesPage(request: Request, env: Env, account: WebdavAccount
   const pager = !query && totalPages > 1 ? `<nav class="files-pager">${currentPage > 1 ? `<a class="pager-link" href="${pageUrl({ page: String(currentPage - 1) })}">‹ 上一页</a>` : `<span class="pager-link disabled">‹ 上一页</span>`}<span class="pager-status">第 ${currentPage} / ${totalPages} 页（共 ${totalEntries} 项）</span>${currentPage < totalPages ? `<a class="pager-link" href="${pageUrl({ page: String(currentPage + 1) })}">下一页 ›</a>` : `<span class="pager-link disabled">下一页 ›</span>`}</nav>` : "";
   const searchHint = query ? `<p class="muted search-hint">${searchCapped ? `匹配项较多，仅显示前 200 条，请细化关键词（共 ${totalEntries} 项匹配）。` : `搜索“${escapeHtml(url.searchParams.get("q") || "")}”，共 ${totalEntries} 项匹配。`}</p>` : "";
   const shareExpirySelect = `<select name="expiresIn" class="share-expiry" title="有效期"><option value="1">1 小时</option><option value="24" selected>1 天</option><option value="168">7 天</option><option value="720">30 天</option></select>`;
+  // 预览：图片文件行内直接展示缩略图，文件名可点击进入预览页；复制按钮的建议副本名服务端生成
+  const previewUrl = (key: string): string => `/?api=preview&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(key)}`;
+  const suggestedCopyName = (key: string): string => {
+    const name = key.slice(key.lastIndexOf("/") + 1);
+    const dot = name.lastIndexOf(".");
+    return `${dot > 0 ? name.slice(0, dot) : name} - 副本${dot > 0 ? name.slice(dot) : ""}`;
+  };
   const rows = [
     ...(currentPath && !query ? [`<tr><td class="check-col"></td><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
-    ...pageEntries.map((entry) => entry.directory ? `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(entry.key)}">${escapeHtml(entry.key.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>` : `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name"><span class="file-icon">FILE</span>${escapeHtml(entry.key.slice(prefix.length))}</td><td>文件</td><td>${formatBytes(entry.size)}</td><td>${formatDateTime(new Date(entry.uploaded))}</td><td><div class="row-actions"><form method="post" action="/?view=files" class="share-form" onsubmit="return confirm('创建该文件的公开分享链接吗？任何人在有效期内都可通过链接下载。')"><input type="hidden" name="action" value="create-share"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}">${shareExpirySelect}<button class="secondary-button" type="submit">分享</button></form><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></div></td></tr>`),
+    ...pageEntries.map((entry) => entry.directory ? `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(entry.key)}">${escapeHtml(entry.key.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>` : `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(entry.key)}"></td><td class="file-name">${previewKindOf(entry.key.slice(entry.key.lastIndexOf("/") + 1)) === "image" ? `<img class="file-thumb" loading="lazy" src="${previewUrl(entry.key)}" alt="">` : `<span class="file-icon">FILE</span>`}<a href="/?view=preview&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(entry.key)}">${escapeHtml(entry.key.slice(prefix.length))}</a></td><td>文件</td><td>${formatBytes(entry.size)}</td><td>${formatDateTime(new Date(entry.uploaded))}</td><td><div class="row-actions"><form method="post" action="/?view=files" class="share-form" onsubmit="return confirm('创建该文件的公开分享链接吗？任何人在有效期内都可通过链接下载。')"><input type="hidden" name="action" value="create-share"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}">${shareExpirySelect}<button class="secondary-button" type="submit">分享</button></form><form method="post" action="/?view=files" class="copy-form"><input type="hidden" name="action" value="copy-file"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="copyName"><button class="secondary-button" type="button" data-suggest="${escapeHtml(suggestedCopyName(entry.key))}" onclick="return promptCopy(this.form, this.getAttribute('data-suggest'))">复制</button></form><form method="post" action="/?view=files" onsubmit="return confirm('确认删除此文件吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(entry.key)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></div></td></tr>`),
   ].join("");
-    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<div class="files-storage-stack"><div class="storage-badge"><span>当前账户已用空间${account.quotaBytes ? " / 配额" : ""}</span><strong>${formatStorageUsage(usedBytes)}${account.quotaBytes ? ` / ${formatStorageUsage(account.quotaBytes)}` : ""}</strong></div><a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a></div>`)}${batchNotice}<section class="files-search"><form method="get" action="/" class="files-search-form"><input type="hidden" name="view" value="files"><input type="hidden" name="account" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(currentPath)}"><input name="q" type="search" placeholder="搜索当前目录及子目录内的文件" value="${escapeHtml(url.searchParams.get("q") || "")}"><button class="secondary-button" type="submit">搜索</button>${query ? `<a class="text-link" href="${pageUrl({ q: "" })}">清除搜索</a>` : ""}</form></section><section class="file-actions"><article class="file-action-card"><div class="file-action-heading"><strong>上传文件</strong><span>支持大文件流式上传并显示进度</span></div><div class="upload-row"><input type="file" id="upload-file-input"><button class="primary-button" type="button" onclick="return startUpload()">上传文件</button></div><div class="upload-progress" id="upload-progress" hidden><div id="upload-progress-bar"></div></div><span class="upload-status" id="upload-status"></span></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th class="check-col"><input type="checkbox" id="files-select-all" onchange="toggleFileSelect(this.checked)" title="全选" aria-label="全选"></th><th>${sortLink("name", "名称")}</th><th>类型</th><th>${sortLink("size", "大小")}</th><th>${sortLink("time", "上传时间")}</th><th>操作</th></tr></thead><tbody>${rows || `<tr><td colspan="6" class="empty-state">${query ? "没有匹配的文件" : "当前目录为空"}</td></tr>`}</tbody></table></section>${pager}${batchToolbar}${sharesSection}<script>function startUpload(){var input=document.getElementById('upload-file-input');var file=input.files&&input.files[0];if(!file){alert('请先选择文件');return false}var status=document.getElementById('upload-status'),wrap=document.getElementById('upload-progress'),bar=document.getElementById('upload-progress-bar');wrap.hidden=false;bar.style.width='0%';status.textContent='上传中…';var xhr=new XMLHttpRequest();xhr.open('POST','/?view=files&action=upload-stream&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(currentPath)}&name='+encodeURIComponent(file.name));xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';status.textContent='上传中 '+p+'%'}};xhr.onload=function(){if(xhr.status===201){status.textContent='上传成功，正在刷新…';location.reload()}else{wrap.hidden=true;status.textContent='上传失败：'+(xhr.responseText||('HTTP '+xhr.status))}};xhr.onerror=function(){wrap.hidden=true;status.textContent='上传失败，请重试'};xhr.send(file);return false}</script></main></body></html>`);
+    return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("文件管理", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a><a class="text-link inverse" href="/">返回账户选择</a>`)}<main class="dashboard">${pageHeadingHtml("FILE MANAGER", "文件管理", `账户：${accountUsername}　当前位置：/${currentPath}`, `<div class="files-storage-stack"><div class="storage-badge"><span>当前账户已用空间${account.quotaBytes ? " / 配额" : ""}</span><strong>${formatStorageUsage(usedBytes)}${account.quotaBytes ? ` / ${formatStorageUsage(account.quotaBytes)}` : ""}</strong></div><a class="secondary-button" href="/?view=trash&account=${encodeURIComponent(accountUsername)}">回收站</a></div>`)}${batchNotice}<section class="files-search"><form method="get" action="/" class="files-search-form"><input type="hidden" name="view" value="files"><input type="hidden" name="account" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(currentPath)}"><input name="q" type="search" placeholder="搜索当前目录及子目录内的文件" value="${escapeHtml(url.searchParams.get("q") || "")}"><button class="secondary-button" type="submit">搜索</button>${query ? `<a class="text-link" href="${pageUrl({ q: "" })}">清除搜索</a>` : ""}</form></section><section class="file-actions"><article class="file-action-card upload-card" id="upload-card"><div class="file-action-heading"><strong>上传文件</strong><span>支持拖拽与多文件，大文件流式上传并显示进度</span></div><div class="upload-row"><input type="file" id="upload-file-input" multiple><button class="primary-button" type="button" onclick="return startUpload()">上传文件</button></div><div class="upload-queue" id="upload-queue"></div><span class="upload-status" id="upload-status"></span></article><article class="file-action-card"><div class="file-action-heading"><strong>新建目录</strong><span>在当前目录创建一个文件夹</span></div><form method="post" action="/?view=files" class="mkdir-form"><input type="hidden" name="action" value="mkdir"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><input name="name" placeholder="目录名称" required><button class="secondary-button" type="submit">新建目录</button></form></article></section><section class="file-table-wrap"><table><thead><tr><th class="check-col"><input type="checkbox" id="files-select-all" onchange="toggleFileSelect(this.checked)" title="全选" aria-label="全选"></th><th>${sortLink("name", "名称")}</th><th>类型</th><th>${sortLink("size", "大小")}</th><th>${sortLink("time", "上传时间")}</th><th>操作</th></tr></thead><tbody>${rows || `<tr><td colspan="6" class="empty-state">${query ? "没有匹配的文件" : "当前目录为空"}</td></tr>`}</tbody></table></section>${pager}${batchToolbar}${sharesSection}<script>function startUpload(){var input=document.getElementById('upload-file-input');var files=input.files&&input.files.length?Array.prototype.slice.call(input.files):[];if(!files.length){alert('请先选择文件');return false}startUploadQueue(files);return false}function startUploadQueue(files){var queue=document.getElementById('upload-queue'),status=document.getElementById('upload-status');status.textContent='';var failed=0;var items=files.map(function(f){var row=document.createElement('div');row.className='upload-item';var nm=document.createElement('span');nm.className='upload-name';nm.textContent=f.name;var bar=document.createElement('div');bar.className='upload-progress';var inner=document.createElement('div');bar.appendChild(inner);var st=document.createElement('span');st.className='upload-item-status';st.textContent='等待中';row.appendChild(nm);row.appendChild(bar);row.appendChild(st);queue.appendChild(row);return {file:f,bar:inner,state:st}});function next(i){if(i>=items.length){status.textContent='全部完成：成功 '+(items.length-failed)+' 个'+(failed?'，失败 '+failed+' 个':'');document.getElementById('upload-file-input').value='';if(!failed)location.reload();return}var it=items[i];it.state.textContent='上传中';it.state.className='upload-item-status active';var xhr=new XMLHttpRequest();xhr.open('POST','/?view=files&action=upload-stream&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(currentPath)}&name='+encodeURIComponent(it.file.name));xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);it.bar.style.width=p+'%';it.state.textContent='上传中 '+p+'%'}};xhr.onload=function(){if(xhr.status===201){it.bar.style.width='100%';it.state.textContent='完成';it.state.className='upload-item-status ok';next(i+1)}else{it.state.textContent='失败：'+(xhr.responseText||('HTTP '+xhr.status));it.state.className='upload-item-status err';failed++;next(i+1)}};xhr.onerror=function(){it.state.textContent='失败，请重试';it.state.className='upload-item-status err';failed++;next(i+1)};xhr.send(it.file)}next(0)}function promptCopy(form,suggested){var name=prompt('复制为新名称（保存在当前目录）：',suggested||'');if(name===null)return false;name=name.trim();if(!name||name.indexOf('/')>=0||name.indexOf(String.fromCharCode(92))>=0||name.indexOf('..')>=0){alert('名称不合法');return false}form.elements['copyName'].value=name;form.submit();return false}(function(){var card=document.getElementById('upload-card');if(!card)return;['dragover','dragenter'].forEach(function(ev){card.addEventListener(ev,function(e){e.preventDefault();card.classList.add('drag-over')})});['dragleave','drop'].forEach(function(ev){card.addEventListener(ev,function(e){e.preventDefault();card.classList.remove('drag-over')})});card.addEventListener('drop',function(e){var files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)startUploadQueue(Array.prototype.slice.call(files))})})()</script></main></body></html>`);
 }
 
 function adminLoginPage(error = ""): Response {
@@ -2113,7 +2246,16 @@ async function checkRateLimit(env: Env, clientIp: string, method: string, conten
 }
 
 // 新增：访问日志页面
-async function adminLogsPage(env: Env, filterUsers: string[] = []): Promise<Response> {
+async function adminLogsPage(request: Request, env: Env, filterUsers: string[] = [], formAction = "/?", hiddenFields: Record<string, string> = {}): Promise<Response> {
+  // 筛选参数：方法精确匹配，状态按类别（2/3/4/5），用户/IP/路径为子串匹配
+  const params = new URL(request.url).searchParams;
+  const LOG_METHODS = ["GET", "PUT", "DELETE", "PROPFIND", "HEAD", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "SHARE"];
+  const filterMethod = LOG_METHODS.includes(params.get("f_method") || "") ? String(params.get("f_method")) : "";
+  const filterStatus = /^[2345]$/.test(params.get("f_status") || "") ? Number(params.get("f_status")) : 0;
+  const filterUser = (params.get("f_user") || "").trim().toLowerCase();
+  const filterIp = (params.get("f_ip") || "").trim().toLowerCase();
+  const filterPath = (params.get("f_path") || "").trim().toLowerCase();
+  const hasFilter = Boolean(filterMethod || filterStatus || filterUser || filterIp || filterPath);
   const logs: AccessLog[] = [];
   let cursor: string | undefined;
   // 日志键为倒序时间戳，list 升序即最新在前：全量视图只需首页，按用户过滤时最多读取 10 页
@@ -2128,7 +2270,15 @@ async function adminLogsPage(env: Env, filterUsers: string[] = []): Promise<Resp
 
   logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   // 普通用户视图展示自己及名下 WebDAV 账户的操作日志（WebDAV 客户端操作的 user 为账户名）；超级管理员/管理入口展示全部
-  const visibleLogs = filterUsers.length ? logs.filter((log) => filterUsers.includes(log.user)) : logs;
+  const accountScopedLogs = filterUsers.length ? logs.filter((log) => filterUsers.includes(log.user)) : logs;
+  const visibleLogs = accountScopedLogs.filter((log) => {
+    if (filterMethod && log.method !== filterMethod) return false;
+    if (filterStatus && Math.floor(log.status / 100) !== filterStatus) return false;
+    if (filterUser && !(log.user || "").toLowerCase().includes(filterUser)) return false;
+    if (filterIp && !(log.clientIp || "").toLowerCase().includes(filterIp)) return false;
+    if (filterPath && !(log.path || "").toLowerCase().includes(filterPath)) return false;
+    return true;
+  });
   const recentLogs = visibleLogs.slice(0, 100);
 
   const logRows = recentLogs.map(log => {
@@ -2143,7 +2293,11 @@ async function adminLogsPage(env: Env, filterUsers: string[] = []): Promise<Resp
     return `<tr><td>${time}</td><td><span class="method ${method}">${method}</span></td><td class="path">${path}</td><td><span class="status ${statusClass}">${status}</span></td><td>${size}</td><td>${ip}</td><td>${user}</td></tr>`;
   }).join("");
 
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><body>${topbarHtml("访问日志", `<a class="text-link inverse" href="/">返回管理中心</a>`)}<main class="dashboard">${pageHeadingHtml("ACCESS LOG", "访问日志", `最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）`)}<section class="data-table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || '<tr><td colspan="7">暂无日志</td></tr>'}</tbody></table></section></main></body></html>`);
+  const hiddenInputs = Object.entries(hiddenFields).map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`).join("");
+  const hiddenQuery = new URLSearchParams(hiddenFields).toString();
+  const filterForm = `<section class="logs-filter"><form method="get" action="${escapeHtml(formAction)}" class="logs-filter-form">${hiddenInputs}<select name="f_method" aria-label="按方法筛选"><option value="">全部方法</option>${LOG_METHODS.map((method) => `<option value="${method}"${method === filterMethod ? " selected" : ""}>${method}</option>`).join("")}</select><select name="f_status" aria-label="按状态筛选"><option value="">全部状态</option>${[2, 3, 4, 5].map((status) => `<option value="${status}"${status === filterStatus ? " selected" : ""}>${status}xx</option>`).join("")}</select><input name="f_user" placeholder="用户" value="${escapeHtml(params.get("f_user") || "")}"><input name="f_ip" placeholder="IP" value="${escapeHtml(params.get("f_ip") || "")}"><input name="f_path" placeholder="路径包含" value="${escapeHtml(params.get("f_path") || "")}"><button class="secondary-button" type="submit">筛选</button>${hasFilter ? `<a class="text-link" href="${escapeHtml(formAction)}${hiddenQuery ? `?${hiddenQuery}` : ""}">清除筛选</a>` : ""}</form></section>`;
+  const logSummary = hasFilter ? `筛选后 ${visibleLogs.length} 条（原始 ${accountScopedLogs.length} 条，保留 ${LOG_RETENTION_DAYS} 天）` : `最近 ${recentLogs.length} 条记录（保留 ${LOG_RETENTION_DAYS} 天）`;
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问日志</title><style>${ADMIN_CSS}${LOGS_CSS}</style><body>${topbarHtml("访问日志", `<a class="text-link inverse" href="/">返回管理中心</a>`)}<main class="dashboard">${pageHeadingHtml("ACCESS LOG", "访问日志", logSummary)}${filterForm}<section class="data-table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>大小</th><th>IP</th><th>用户</th></tr></thead><tbody>${logRows || `<tr><td colspan="7">${hasFilter ? "没有符合条件的日志" : "暂无日志"}</td></tr>`}</tbody></table></section></main></body></html>`);
 }
 
 function formatBytes(bytes: number): string {
@@ -2184,7 +2338,15 @@ th{background:#f6f8fa;font-weight:600}
 .status.error{background:#ffebee;color:#c62828}
 a{color:#1769aa;text-decoration:none}[data-theme="dark"] a{color:var(--link-color)}
 a:hover{text-decoration:underline}
+.logs-filter{margin:0 0 6px}
+.logs-filter-form{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.logs-filter-form select,.logs-filter-form input{height:40px;padding:0 10px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit}
+.logs-filter-form input{width:150px}
+.logs-filter-form .secondary-button{margin:0;min-height:40px;height:40px;padding:0 16px}
 `;
+
+// 预览页专用样式（与 FILES_CSS 搭配使用）
+const PREVIEW_CSS = `[data-theme="dark"] .preview-text{background:#122326}[data-theme="dark"] .preview-media img{border-color:#2d484b}`;
 
 // 新增：回收站管理页面
 async function adminTrashPage(env: Env, accountUsername: string, warn = ""): Promise<Response> {
@@ -2204,15 +2366,23 @@ async function adminTrashPage(env: Env, accountUsername: string, warn = ""): Pro
 
   trashItems.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
 
+  // 剩余保留天数：不足 7 天的条目高亮提醒，并在页头汇总即将过期数量
+  const daysLeftOf = (item: { deletedAt: string }): number => {
+    const deletedMs = Date.parse(item.deletedAt);
+    return Number.isFinite(deletedMs) ? Math.min(TRASH_RETENTION_DAYS, Math.max(0, TRASH_RETENTION_DAYS - Math.floor((Date.now() - deletedMs) / 86400000))) : TRASH_RETENTION_DAYS;
+  };
+  const expiringSoonCount = trashItems.filter((item) => daysLeftOf(item) <= 7).length;
   const trashRows = trashItems.map(item => {
     const time = formatDateTime(item.deletedAt);
     const path = escapeXml(item.originalPath);
     const type = item.isDirectory ? "目录" : "文件";
     const size = item.size ? formatBytes(item.size) : "-";
-    return `<tr><td class="check-col"><input type="checkbox" class="trash-check" form="trash-toolbar-form" name="paths" value="${escapeXml(item.key)}"></td><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}</td><td><div class="row-actions"><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.key)}"><button type="submit" class="restore-btn">恢复</button></form><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" onsubmit="return confirm('确定 要永久删除此项吗？此操作不可恢复！')"><input type="hidden" name="action" value="purge"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="paths" value="${escapeXml(item.key)}"><button type="submit" class="purge-btn">永久删除</button></form></div></td></tr>`;
+    const daysLeft = daysLeftOf(item);
+    const daysLeftHtml = `<span class="days-left${daysLeft <= 7 ? " urgent" : ""}">${daysLeft <= 0 ? "不足 1 天，即将清理" : `剩余 ${daysLeft} 天`}</span>`;
+    return `<tr><td class="check-col"><input type="checkbox" class="trash-check" form="trash-toolbar-form" name="paths" value="${escapeXml(item.key)}"></td><td>${path}</td><td>${type}</td><td>${size}</td><td>${time}${daysLeftHtml}</td><td><div class="row-actions"><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}"><input type="hidden" name="action" value="restore"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeXml(item.key)}"><button type="submit" class="restore-btn">恢复</button></form><form method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" onsubmit="return confirm('确定 要永久删除此项吗？此操作不可恢复！')"><input type="hidden" name="action" value="purge"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="paths" value="${escapeXml(item.key)}"><button type="submit" class="purge-btn">永久删除</button></form></div></td></tr>`;
   }).join("");
 
-  const warnBanner = warn === "conflict" ? `<div class="trash-warn">部分条目未能恢复：目标路径已存在同名文件，已跳过；对应条目已保留在回收站</div>` : "";
+  const warnBanner = `${warn === "conflict" ? `<div class="trash-warn">部分条目未能恢复：目标路径已存在同名文件，已跳过；对应条目已保留在回收站</div>` : ""}${expiringSoonCount ? `<div class="trash-warn">${expiringSoonCount} 项将在 7 天内到期并被自动清理，需要保留请尽快恢复</div>` : ""}`;
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>回收站</title><style>${ADMIN_CSS}${FILES_CSS}${TRASH_CSS}</style><body>${topbarHtml("回收站", `<a class="text-link inverse" href="/?view=account&account=${encodeURIComponent(accountUsername)}">返回账户管理</a>`)}<main class="dashboard">${warnBanner}${pageHeadingHtml("TRASH", "回收站", `账户：${accountUsername}。已删除的文件将在 ${TRASH_RETENTION_DAYS} 天后自动清理`, `<a class="secondary-button" href="/?view=files&account=${encodeURIComponent(accountUsername)}">回到文件管理</a>`)}<section class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-col"><input type="checkbox" id="trash-select-all" onchange="toggleTrashSelect(this.checked)" title="全选" aria-label="全选"></th><th>原路径</th><th>类型</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${trashRows || '<tr><td colspan="6">回收站为空</td></tr>'}</tbody></table></section>${trashItems.length > 0 ? `<form id="trash-toolbar-form" method="post" action="/?view=trash&account=${encodeURIComponent(accountUsername)}" class="trash-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><button type="submit" name="action" value="restore" class="restore-btn" onclick="return confirmTrashRestore()">恢复选中</button><button type="submit" name="action" value="purge" class="empty-btn" onclick="return confirmTrashPurge()">永久删除选中</button><button type="submit" name="action" value="empty" class="empty-btn" onclick="return confirm('确定要清空回收站吗？此操作不可恢复！')">清空回收站</button></form><script>function toggleTrashSelect(checked){document.querySelectorAll('.trash-check').forEach(function(c){c.checked=checked});}function confirmTrashPurge(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要操作的文件');return false;}return confirm('确定要永久删除选中的 '+n+' 项吗？此操作不可恢复！');}function confirmTrashRestore(){var n=document.querySelectorAll('.trash-check:checked').length;if(!n){alert('请先勾选要恢复的文件');return false;}return confirm('确定要恢复选中的 '+n+' 项吗？');}</script>` : ""}</main></body></html>`);
 }
 
@@ -2234,6 +2404,8 @@ td.check-col{text-align:center}
 .trash-toolbar{display:flex;justify-content:flex-end;gap:10px;margin:20px 0}
 .empty-btn{padding:10px 20px;background:#c62828;color:white;border:0;border-radius:5px;cursor:pointer;font-size:14px}
 .empty-btn:hover{background:#b71c1c}
+.days-left{display:block;margin-top:3px;font-size:12px;color:var(--text-secondary)}
+.days-left.urgent{color:#c62828;font-weight:700}
 a{color:#1769aa;text-decoration:none}[data-theme="dark"] a{color:var(--link-color)}
 a:hover{text-decoration:underline}
 `;
@@ -2271,9 +2443,27 @@ td.check-col{text-align:center}
 .share-form{display:flex;align-items:center;gap:6px;margin:0}
 .share-expiry{height:34px;padding:0 6px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit;font-size:13px}
 .upload-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.upload-card.drag-over{border-color:#3d9368;box-shadow:0 0 0 2px rgba(61,147,104,.25)}
+.upload-queue{margin-top:10px;display:flex;flex-direction:column;gap:8px}
+.upload-item{display:flex;align-items:center;gap:10px;font-size:13px}
+.upload-item .upload-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.upload-item .upload-progress{flex:2;height:6px;margin-top:0}
+.upload-item-status{min-width:72px;text-align:right;color:var(--text-secondary)}
+.upload-item-status.active{color:var(--text-primary)}
+.upload-item-status.ok{color:#176b48}
+.upload-item-status.err{color:#a43f35}
 .upload-progress{height:8px;border-radius:4px;background:rgba(127,127,127,.2);margin-top:10px;overflow:hidden}
+.upload-progress div{height:100%;width:0;border-radius:4px;background:#3d9368;transition:width .2s}
 .upload-progress #upload-progress-bar{height:100%;width:0;border-radius:4px;background:#3d9368;transition:width .2s}
 .upload-status{display:block;margin-top:6px;font-size:13px;color:var(--text-secondary);min-height:18px}
+.file-thumb{width:34px;height:34px;object-fit:cover;border-radius:4px;margin-right:8px;vertical-align:middle;border:1px solid var(--card-border);flex:none}
+.copy-form{margin:0}
+.preview-shell{display:block;margin:0 auto;max-width:900px;padding:20px 24px}
+.preview-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px}
+.preview-heading strong{font-size:16px;word-break:break-all}
+.preview-meta{display:block;margin-top:4px;color:var(--text-secondary);font-size:12px}
+.preview-media img{max-width:100%;border-radius:6px;border:1px solid var(--card-border)}
+.preview-text{max-height:70vh;overflow:auto;background:var(--input-bg);border:1px solid var(--card-border);border-radius:6px;padding:14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--text-primary)}
 .files-pager{display:flex;align-items:center;justify-content:center;gap:16px;margin:16px 0 0;font-size:14px}
 .pager-link{color:var(--text-primary);text-decoration:none;padding:6px 12px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg)}
 .pager-link:hover:not(.disabled){border-color:var(--text-secondary)}
