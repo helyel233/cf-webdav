@@ -781,7 +781,8 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
 function adminPath(value: string): string {
   const path = value.trim().replace(/^\/+|\/+$/g, "");
   if (!path) return "";
-  if (path.split("/").some((segment) => !segment || segment === "." || segment === "..")) throw new Error("invalid path");
+  // __trash 为回收站保留命名空间（与 WebDAV 层 requestPath 一致），管理端 mkdir/upload/移动一律拒绝写入
+  if (path.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment === "__trash")) throw new Error("invalid path");
   return path;
 }
 
@@ -799,7 +800,12 @@ function filesPageRedirect(accountUsername: string, currentPath: string, extraQu
 async function adminFilesAction(request: Request, env: Env, form: FormData, username: string, accountUsername: string, account: WebdavAccount): Promise<Response> {
   const scopedEnv = createScopedEnv(env, storageScope(account));
   const action = String(form.get("action") || "");
-  const currentPath = adminPath(String(form.get("currentPath") || ""));
+  let currentPath = "";
+  try {
+    currentPath = adminPath(String(form.get("currentPath") || ""));
+  } catch {
+    return textResponse("非法路径", 400);
+  }
   let operationPath = currentPath;
   let operationMethod = "POST";
   let responseStatus = 303;
@@ -841,24 +847,36 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       }
       return filesPageRedirect(accountUsername, currentPath, `&deleted=${deletedCount}`);
     } else if (action === "batch-move") {
-      // 批量移动：目标目录已存在同名内容时跳过该项，回跳后提示统计结果
+      // 批量移动：目标目录必须已存在（或根），目标已存在同名内容时跳过该项，回跳后提示统计结果
       const paths = normalizeBatchPaths(form);
       if (!paths.length) return textResponse("请先勾选要移动的文件或目录", 400);
       let targetDir = "";
       try { targetDir = adminPath(String(form.get("targetDir") || "")); } catch { return textResponse("目标目录路径不合法", 400); }
+      if (targetDir && !(await scopedEnv.WEBDAV_KV.get(dirKey(targetDir))) && !(await hasChildren(scopedEnv, targetDir))) return textResponse("目标目录不存在，请先创建后再移动", 400);
       operationMethod = "MOVE";
       let movedCount = 0;
       let skippedCount = 0;
+      let missingCount = 0;
+      let failedCount = 0;
       for (const source of paths) {
-        const result = await moveEntryTo(scopedEnv, source, targetDir);
+        // 单项失败（复制回滚后 re-throw 等）不中断整批，统计后继续处理剩余项
+        let result: "moved" | "conflict" | "missing";
+        try {
+          result = await moveEntryTo(scopedEnv, source, targetDir);
+        } catch {
+          failedCount++;
+          continue;
+        }
         if (result === "moved") {
           movedCount++;
           await logAccess(env, { method: "MOVE", path: source, status: 201, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
+        } else if (result === "missing") {
+          missingCount++;
         } else {
           skippedCount++;
         }
       }
-      return filesPageRedirect(accountUsername, currentPath, `&moved=${movedCount}&skipped=${skippedCount}`);
+      return filesPageRedirect(accountUsername, currentPath, `&moved=${movedCount}&skipped=${skippedCount}&missing=${missingCount}&failed=${failedCount}`);
     }
   } catch (error) {
     return textResponse(error instanceof Error ? error.message : "文件操作失败", 400);
@@ -876,23 +894,61 @@ async function adminFilesPage(request: Request, env: Env, accountUsername: strin
     return textResponse("Invalid path", 400);
   }
   const prefix = currentPath ? `${currentPath}/` : "";
-  const listed = await env.WEBDAV_BUCKET.list({ prefix, delimiter: "/" });
-  const directories = listed.delimitedPrefixes
-    .filter((item) => !item.startsWith("__trash/"))
-    .map((item) => item.slice(0, -1));
-  const files = listed.objects.filter((item) => !item.key.startsWith("__trash/"));
+  // 游标循环取全量一级条目，避免单页上限静默截断
+  const directorySet = new Set<string>();
+  const files: R2Object[] = [];
+  let listCursor: string | undefined;
+  do {
+    const listed = await env.WEBDAV_BUCKET.list({ prefix, delimiter: "/", cursor: listCursor });
+    for (const item of listed.delimitedPrefixes) if (!item.startsWith("__trash/")) directorySet.add(item.slice(0, -1));
+    files.push(...listed.objects.filter((item) => !item.key.startsWith("__trash/")));
+    listCursor = listed.truncated ? listed.cursor : undefined;
+  } while (listCursor);
+  // 合并 KV dir: 标记，空目录（无 R2 子对象）也可见，与 PROPFIND 行为一致
+  for (const key of await listAllKV(env, DIR_PREFIX)) {
+    const directory = decodeURIComponent(key.slice(DIR_PREFIX.length));
+    if (!directory.startsWith(prefix) || directory === currentPath) continue;
+    const child = directory.slice(prefix.length).split("/")[0];
+    if (child && child !== "__trash") directorySet.add(`${prefix}${child}`);
+  }
+  const directories = [...directorySet].sort();
   const parent = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
   // 当前账户已用存储空间（读取账户作用域用量缓存，缺档时自动全量重建）
   const usedBytes = await getAccountStorageUsage(env);
-  // 批量操作结果提示（重定向回跳参数）
-  const deleted = url.searchParams.get("deleted");
-  const moved = url.searchParams.get("moved");
-  const skipped = url.searchParams.get("skipped");
+  // 批量操作结果提示（重定向回跳参数）：仅接受纯数字计数，拒绝任意拼接值以防注入
+  const countParam = (value: string | null): number | null => {
+    if (value === null || !/^\d+$/.test(value)) return null;
+    const count = Number(value);
+    return Number.isSafeInteger(count) ? count : null;
+  };
+  const deletedCount = countParam(url.searchParams.get("deleted"));
+  const movedCount = countParam(url.searchParams.get("moved"));
+  const skippedCount = countParam(url.searchParams.get("skipped")) ?? 0;
+  const missingCount = countParam(url.searchParams.get("missing")) ?? 0;
+  const failedCount = countParam(url.searchParams.get("failed")) ?? 0;
   const noticeParts: string[] = [];
-  if (deleted && deleted !== "0") noticeParts.push(`成功删除 ${deleted} 项，内容已移入回收站`);
-  if (moved !== null) noticeParts.push(`成功移动 ${moved} 项${skipped && skipped !== "0" ? `，跳过 ${skipped} 项（目标目录已存在同名内容）` : ""}`);
+  if (deletedCount !== null) noticeParts.push(deletedCount ? `成功删除 ${deletedCount} 项，内容已移入回收站` : "未删除任何项（可能已被删除或不存在）");
+  if (movedCount !== null) {
+    const detail = [skippedCount ? `，${skippedCount} 项因目标已存在同名内容被跳过` : "", missingCount ? `，${missingCount} 项已不存在` : "", failedCount ? `，${failedCount} 项处理失败` : ""].filter(Boolean).join("");
+    noticeParts.push(`成功移动 ${movedCount} 项${detail}`);
+  }
   const batchNotice = noticeParts.length ? `<div class="batch-notice">${noticeParts.join("；")}</div>` : "";
-  const batchToolbar = `<form id="files-batch-form" method="post" action="/?view=files" class="batch-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><span class="batch-hint">已选 <b id="batch-count">0</b> 项</span><input class="batch-target-input" name="targetDir" placeholder="移动目标目录，如 photos/2024，留空为根目录"><button class="secondary-button" type="submit" name="action" value="batch-move" onclick="return confirmBatchMove()">移动选中</button><button class="danger-button" type="submit" name="action" value="batch-delete" onclick="return confirmBatchDelete()">删除选中</button></form><script>function checkedFileCount(){return document.querySelectorAll('.file-check:checked').length}function toggleFileSelect(checked){document.querySelectorAll('.file-check').forEach(function(c){c.checked=checked});updateBatchCount()}function updateBatchCount(){var el=document.getElementById('batch-count');if(el)el.textContent=checkedFileCount()}function confirmBatchDelete(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}return confirm('确定删除选中的 '+n+' 项吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')}function confirmBatchMove(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}var t=document.querySelector('input[name=targetDir]').value.trim()||'根目录';return confirm('确定将选中的 '+n+' 项移动到「'+t+'」吗？目标已存在同名内容时将跳过。')}document.addEventListener('change',function(e){if(e.target&&e.target.classList&&e.target.classList.contains('file-check'))updateBatchCount()})</script>`;
+  // 移动目标下拉：收集账户内全部目录（dir: 标记 + R2 对象父链推导），排除 __trash 与当前目录自身及其子目录（移入即冲突）
+  const targetDirOptions = new Set<string>(directorySet);
+  for (const object of await listAllObjects(env, "")) {
+    const segments = object.key.split("/");
+    if (segments.includes("__trash")) continue;
+    segments.pop();
+    let dir = "";
+    for (const segment of segments) { dir = dir ? `${dir}/${segment}` : segment; targetDirOptions.add(dir); }
+  }
+  for (const key of await listAllKV(env, DIR_PREFIX)) {
+    const dir = decodeURIComponent(key.slice(DIR_PREFIX.length));
+    if (dir && !dir.split("/").includes("__trash")) targetDirOptions.add(dir);
+  }
+  const targetDirs = [...targetDirOptions].filter((dir) => !currentPath || (dir !== currentPath && !dir.startsWith(`${currentPath}/`))).sort();
+  const targetOptions = ['<option value="">根目录</option>', ...targetDirs.map((dir) => `<option value="${escapeHtml(dir)}">${escapeHtml(dir)}</option>`)].join("");
+  const batchToolbar = `<form id="files-batch-form" method="post" action="/?view=files" class="batch-toolbar"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><span class="batch-hint">已选 <b id="batch-count">0</b> 项</span><select class="batch-target-input" name="targetDir" aria-label="移动目标目录">${targetOptions}</select><button class="secondary-button" type="submit" name="action" value="batch-move" onclick="return confirmBatchMove()">移动选中</button><button class="danger-button" type="submit" name="action" value="batch-delete" onclick="return confirmBatchDelete()">删除选中</button></form><script>function checkedFileCount(){return document.querySelectorAll('.file-check:checked').length}function toggleFileSelect(checked){document.querySelectorAll('.file-check').forEach(function(c){c.checked=checked});updateBatchCount()}function updateBatchCount(){var el=document.getElementById('batch-count');if(el)el.textContent=checkedFileCount()}function confirmBatchDelete(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}return confirm('确定删除选中的 '+n+' 项吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')}function confirmBatchMove(){var n=checkedFileCount();if(!n){alert('请先勾选要操作的文件或目录');return false}var s=document.querySelector('select[name=targetDir]');var t=s.options[s.selectedIndex].text;return confirm('确定将选中的 '+n+' 项移动到「'+t+'」吗？目标已存在同名内容时将跳过。')}document.addEventListener('change',function(e){if(e.target&&e.target.classList&&e.target.classList.contains('file-check'))updateBatchCount()})</script>`;
   const rows = [
     ...(currentPath ? [`<tr><td class="check-col"></td><td class="file-name"><a href="/?view=files&account=${encodeURIComponent(accountUsername)}${parent ? `&path=${encodeURIComponent(parent)}` : ""}">↩ 返回上级目录</a></td><td>目录</td><td>-</td><td>-</td><td>-</td></tr>`] : []),
     ...directories.map((directory) => `<tr><td class="check-col"><input type="checkbox" class="file-check" form="files-batch-form" name="paths" value="${escapeHtml(directory)}"></td><td class="file-name"><span class="folder-icon">DIR</span><a href="/?view=files&account=${encodeURIComponent(accountUsername)}&path=${encodeURIComponent(directory)}">${escapeHtml(directory.slice(prefix.length))}/</a></td><td>目录</td><td>-</td><td>-</td><td><form method="post" action="/?view=files" onsubmit="return confirm('删除该目录及其内部所有文件吗？内容将移入回收站，可在 ${TRASH_RETENTION_DAYS} 天内恢复。')"><input type="hidden" name="action" value="delete"><input type="hidden" name="accountUsername" value="${escapeHtml(accountUsername)}"><input type="hidden" name="path" value="${escapeHtml(directory)}"><input type="hidden" name="currentPath" value="${escapeHtml(currentPath)}"><button class="danger-button" type="submit">删除</button></form></td></tr>`),
@@ -1583,8 +1639,9 @@ async function moveEntryTo(env: Env, source: string, targetDir: string): Promise
   const isDirectory = !sourceObject;
   if (isDirectory && !(await env.WEBDAV_KV.get(dirKey(source))) && !(await hasChildren(env, source))) return "missing";
 
+  // 目标位置只要已有内容（文件对象 / dir: 标记 / 子内容）即冲突跳过；文件移到同名目录同样拒绝，避免同一路径既是文件又是目录
   const destinationObject = await env.WEBDAV_BUCKET.head(r2Key(destination));
-  if (destinationObject || (isDirectory && (await env.WEBDAV_KV.get(dirKey(destination)) || await hasChildren(env, destination)))) return "conflict";
+  if (destinationObject || (await env.WEBDAV_KV.get(dirKey(destination))) || (await hasChildren(env, destination))) return "conflict";
 
   if (isDirectory) {
     const objects = await listAllObjects(env, `${source}/`);
@@ -1988,7 +2045,7 @@ td.check-col{text-align:center}
 [data-theme="dark"] .batch-notice{background:#152a22;color:#5ec98f}
 .batch-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:10px;margin:16px 0 0}
 .batch-hint{margin-right:auto;font-size:13px;color:var(--text-secondary)}
-.batch-toolbar .batch-target-input{flex:1;min-width:200px;max-width:320px;height:40px;padding:0 10px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit}
+.batch-toolbar .batch-target-input{flex:1;min-width:200px;max-width:320px;height:40px;padding:0 10px;border:1px solid var(--input-border);border-radius:4px;background:var(--input-bg);color:var(--text-primary);font:inherit;cursor:pointer}
 .batch-toolbar .secondary-button,.batch-toolbar .danger-button{margin:0;height:40px;min-height:40px;padding:0 16px}
 .files-storage-stack{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
 .files-storage-stack .storage-badge{align-items:flex-end;text-align:right}
