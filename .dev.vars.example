@@ -24,8 +24,8 @@ ENABLE_ACCESS_LOG=true
 # 可选：会话空闲超时分钟数（0/缺省 = 不启用）
 # SESSION_IDLE_MINUTES=60
 
-# 可选：超级管理员强制空闲超时分钟数（默认 5，0 = 禁用）
-# ADMIN_IDLE_MINUTES=5
+# 可选：超级管理员强制空闲超时分钟数（默认 1，0 = 禁用）
+# ADMIN_IDLE_MINUTES=1
 
 # 可选：登录防爆破（窗口期内最大失败次数 / 锁定分钟数）
 # LOGIN_MAX_ATTEMPTS=5

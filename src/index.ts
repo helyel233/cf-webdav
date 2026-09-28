@@ -252,7 +252,7 @@ function getSessionIdleSeconds(env: Env): number {
 }
 function getAdminIdleSeconds(env: Env): number {
   // 超级管理员强制空闲超时：页面关闭后心跳停止，超时即吊销会话（近似“关闭即注销”）；0 = 禁用
-  return intVarOf(env.ADMIN_IDLE_MINUTES, 5, 0, 1440) * 60;
+  return intVarOf(env.ADMIN_IDLE_MINUTES, 1, 0, 1440) * 60;
 }
 function getLoginLockConfig(env: Env): { maxAttempts: number; windowSeconds: number } {
   return { maxAttempts: intVarOf(env.LOGIN_MAX_ATTEMPTS, 5, 1, 100), windowSeconds: intVarOf(env.LOGIN_LOCK_MINUTES, 15, 1, 1440) * 60 };
