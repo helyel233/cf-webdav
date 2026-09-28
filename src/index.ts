@@ -810,7 +810,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     // 登出必须吊销服务端会话，仅清 cookie 会让泄露的 token 继续有效
     const token = sessionToken(request);
     if (token) await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
-    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" } });
   }
   if (url.pathname === "/__admin/register") {
     if (env.ENABLE_PUBLIC_REGISTRATION === "false") return adminLoginPage("注册已关闭，请联系管理员创建账户");
@@ -873,8 +873,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     // exp 为绝对过期毫秒时间戳：KV TTL 可被刷新重写，绝对时间保证“保持时长”语义不被活跃请求延长
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now(), exp: Date.now() + sessionTtl * 1000 }), { expirationTtl: sessionTtl });
     await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
-    const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/`;
+    const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/`;
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": sessionCookie } });
+  }
+  // 会话诊断：展示当前请求是否携带 Cookie 与服务端会话状态，用于定位“Cookie 存在但仍要求登录”类问题
+  if (url.searchParams.get("api") === "session-info" && request.method === "GET") {
+    const diagToken = sessionToken(request);
+    if (!diagToken) return new Response(JSON.stringify({ cookieReceived: false, sessionExists: false, message: "当前请求未携带会话 Cookie：若页面显示已登录而此接口显示未收到，说明浏览器未随请求发送 Cookie（常见于 SameSite=Strict 下从外部链接跳转打开）" }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+    const diagSession = sessionValueOf(await env.WEBDAV_KV.get(`${SESSION_PREFIX}${diagToken}`));
+    if (!diagSession) return new Response(JSON.stringify({ cookieReceived: true, sessionExists: false, message: "Cookie 已收到，但服务端会话记录不存在（KV 中已过期或被吊销）" }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+    const diagRemain = diagSession.exp ? Math.max(0, Math.round((diagSession.exp - Date.now()) / 1000)) : null;
+    return new Response(JSON.stringify({ cookieReceived: true, sessionExists: true, user: diagSession.user, lastSeen: new Date(diagSession.lastSeen).toISOString(), expiresAt: diagSession.exp ? new Date(diagSession.exp).toISOString() : null, remainSeconds: diagRemain, message: "会话有效" }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
   }
   const sessionUser_ = await sessionUser(request, env);
   if (!sessionUser_) return adminLoginPage();
@@ -909,7 +918,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       await logAudit(env, { actor: sessionUser_, action: "change-own-password", target: sessionUser_, clientIp: clientIpOf(request) });
       // 改密后吊销该用户全部会话（含当前），要求用新密码重新登录
       await revokeUserSessions(env, sessionUser_);
-      return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+      return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" } });
     } else if (String(form.get("action") || "") === "totp-setup-start") {
       const secret = generateTotpSecret();
       await env.WEBDAV_KV.put(`${TOTP_PENDING_PREFIX}${sessionUser_}`, secret, { expirationTtl: 600 });
@@ -1044,10 +1053,10 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         if (sessionHours > 0) {
           const ttl = Math.max(3600, Math.round(sessionHours * 3600));
           await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, JSON.stringify({ user: adminUsername, lastSeen: Date.now(), exp: Date.now() + ttl * 1000 }), { expirationTtl: ttl });
-          return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${ttl}` } });
+          return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${ttl}` } });
         }
         await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, JSON.stringify({ user: adminUsername, lastSeen: Date.now(), exp: Date.now() + SESSION_TTL * 1000 }), { expirationTtl: SESSION_TTL });
-        return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/` } });
+        return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Lax; Path=/` } });
       }
       return await adminPage(request, env, "登录状态已更新");
     }
@@ -1162,7 +1171,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       }
       await env.WEBDAV_KV.put(ADMIN_ACCOUNTS_KEY, JSON.stringify(admins));
       await env.WEBDAV_KV.put(WEBDAV_ACCOUNTS_KEY, JSON.stringify(webdavAccounts));
-      return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+      return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" } });
     }
     if (view === "files" && ["upload", "delete", "mkdir", "batch-delete", "batch-move", "create-share", "revoke-share", "copy-file"].includes(action)) {
       const selected = webdavAccounts[String(form.get("accountUsername") || url.searchParams.get("account") || "")];
@@ -1262,7 +1271,7 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
     await logAudit(env, { actor: currentAdmin.username, action: "save-admin-password", target: currentAdmin.username, clientIp: clientIpOf(request) });
     // 改密后吊销全部会话（含当前），要求用新密码重新登录
     await revokeUserSessions(env, currentAdmin.username);
-    return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+    return new Response(null, { status: 303, headers: { Location: "/__admin/login", "Set-Cookie": "cf_webdav_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" } });
   }
   if (action === "create-user") {
     const username = String(form.get("userUsername") || "").trim();
