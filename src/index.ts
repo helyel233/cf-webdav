@@ -547,6 +547,8 @@ interface AdminAccount extends Credentials {
   totpSecret?: string;
   // 登录与 WebDAV 访问 IP 白名单（精确 IP / IPv4 前缀 / IPv4 CIDR），空 = 不限制
   ipAllowlist?: string[];
+  // 登录状态保持时长（小时）：168=7天/72=3天/24=1天/12/1；0=关闭浏览器即注销；普通用户缺省 24，超级管理员强制 0
+  sessionDurationHours?: number;
 }
 
 interface AppPasswordEntry {
@@ -862,11 +864,16 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
       return adminLoginPage("两步验证码错误或已过期");
     }
-    // 会话记录最后活跃时间（支持 SESSION_IDLE_MINUTES 空闲超时）
+    // 会话记录最后活跃时间（支持 SESSION_IDLE_MINUTES 空闲超时）；保持时长由用户在用户管理页自选
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
-    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now() }), { expirationTtl: SESSION_TTL });
+    // sessionDurationHours = 0 时不设 Max-Age：Cookie 成为浏览器会话 Cookie，关闭浏览器即注销；KV 以 7 天兜底过期
+    // 超级管理员会话强制“关闭浏览器即注销”；普通用户自选（缺省 1 天）
+    const sessionHours = credentials.role === "admin" ? 0 : credentials.sessionDurationHours ?? 24;
+    const sessionTtl = sessionHours > 0 ? Math.max(3600, Math.round(sessionHours * 3600)) : SESSION_TTL;
+    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now() }), { expirationTtl: sessionTtl });
     await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
-    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}` } });
+    const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/`;
+    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": sessionCookie } });
   }
   const sessionUser_ = await sessionUser(request, env);
   if (!sessionUser_) return adminLoginPage();
@@ -1016,6 +1023,33 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       return await adminPage(request, env, "密码已更新");
     }
     if (action === "create-admin" || action === "save-admin") return textResponse("普通用户无权执行管理员操作", 403);
+    // 登录状态自选（7天/3天/1天/12小时/1小时/关闭浏览器即注销）；保存后当前会话立即按新时长调整
+    if (action === "set-session-duration") {
+      const allowedHours = [168, 72, 24, 12, 1, 0];
+      const sessionHours = Number(form.get("sessionHours"));
+      if (!allowedHours.includes(sessionHours)) return await adminPage(request, env, "登录状态时长不合法");
+      const durationError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+        const account = accounts[adminUsername];
+        if (!account) return "账户不存在";
+        accounts[adminUsername] = { ...account, sessionDurationHours: sessionHours };
+        return null;
+      });
+      if (durationError) return await adminPage(request, env, durationError);
+      await logAudit(env, { actor: adminUsername, action: "set-session-duration", target: adminUsername, clientIp: clientIpOf(request), detail: sessionHours > 0 ? `${sessionHours} 小时` : "关闭浏览器即注销" });
+      // 立即应用到当前会话：Cookie 与 KV TTL 同步刷新；0 时改为浏览器会话 Cookie（关闭浏览器即注销）
+      const currentToken = sessionToken(request);
+      const sessionRaw = currentToken ? await env.WEBDAV_KV.get(`${SESSION_PREFIX}${currentToken}`) : null;
+      if (currentToken && sessionRaw) {
+        if (sessionHours > 0) {
+          const ttl = Math.max(3600, Math.round(sessionHours * 3600));
+          await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, sessionRaw, { expirationTtl: ttl });
+          return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${ttl}` } });
+        }
+        await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, sessionRaw, { expirationTtl: SESSION_TTL });
+        return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/` } });
+      }
+      return await adminPage(request, env, "登录状态已更新");
+    }
     if (action === "create-webdav") {
       const username = String(form.get("serviceUsername") || "").trim();
       const password = String(form.get("servicePassword") || "");
@@ -1367,9 +1401,15 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
 async function adminLandingPage(request: Request, env: Env, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string, usedStorage: number): Promise<Response> {
   const usedGb = (usedStorage / 1024 ** 3).toFixed(2);
   const totalGb = String((await getUserStorageLimit(env, adminUsername)) / 1024 ** 3);
+  // 登录状态自选下拉：普通用户当前值取自账户设置（缺省 1 天）；超级管理员不渲染本页（强制关闭即注销）
+  const sessionHours = (await getAdminAccounts(env))[adminUsername]?.sessionDurationHours ?? 24;
+  const sessionOptions = (["168|7 天", "72|3 天", "24|1 天", "12|12 小时", "1|1 小时", "0|关闭浏览器后立即注销"] as const).map((item) => {
+    const [value, label] = item.split("|");
+    return `<option value="${value}"${Number(value) === sessionHours ? " selected" : ""}>${label}</option>`;
+  }).join("");
   const accountCards = accounts.map((account) => `<a class="config-card account-card account-choice" href="/?view=account&account=${encodeURIComponent(account.username)}"><div class="card-heading"><div><p class="eyebrow">WEBDAV ACCOUNT</p><h2>${escapeHtml(account.username)}</h2></div><span class="icon-badge">${escapeHtml(account.uuid || "------")}</span></div><p class="muted">账户链接：${escapeHtml(webdavAccountUrl(request, account))}</p><span class="primary-button inline-button">进入账户管理</span></a>`).join("");
   const createForm = accounts.length < 2 ? `<article class="config-card account-card"><div class="card-heading"><div><p class="eyebrow">NEW ACCOUNT</p><h2>新建 WebDAV 账户</h2></div><span class="icon-badge">+</span></div><p class="muted">当前管理员最多拥有 2 个 WebDAV 账户。</p><form method="post" action="/?view=home" class="config-form"><input type="hidden" name="action" value="create-webdav"><label>账户<input name="serviceUsername" autocomplete="username" required></label><label>密码<input name="servicePassword" type="password" autocomplete="new-password" minlength="8" required></label><label>6 位 UUID<div class="uuid-row"><input name="accountUuid" value="${escapeHtml(nextUuid)}" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required><button type="button" class="secondary-button uuid-check-btn" onclick="return checkUuidAvailability(this)">检查 UUID</button></div><span id="uuid-check-result" class="uuid-result"></span></label><button class="primary-button" type="submit">创建 WebDAV 账户</button></form></article>` : "";
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("用户管理", `<span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link inverse" href="/?view=change-password">修改密码</a><a class="text-link inverse" href="/?api=export-data">导出我的数据</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("USER MANAGEMENT", "用户管理", "进入账户后只能管理该账户自己的文件。", `<div class="storage-badge"><span>当前已用容量（GB）：<strong>${usedGb}</strong></span><span>总容量（GB）：<strong>${totalGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户管理</title><style>${ADMIN_CSS}${FILES_CSS}</style><body>${topbarHtml("用户管理", `<span class="status-dot">管理员：${escapeHtml(adminUsername)}</span><a class="text-link inverse" href="/?view=change-password">修改密码</a><a class="text-link inverse" href="/?api=export-data">导出我的数据</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("USER MANAGEMENT", "用户管理", "进入账户后只能管理该账户自己的文件。", `<div class="storage-badge"><span>当前已用容量（GB）：<strong>${usedGb}</strong></span><span>总容量（GB）：<strong>${totalGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid">${accountCards}${createForm}</section><p class="muted">${accounts.length}/2 个 WebDAV 账户</p><section class="config-card session-card"><div class="card-heading"><div><p class="eyebrow">SESSION</p><h2>登录状态</h2></div></div><p class="muted">选择登录状态保持时长，保存后立即对当前登录生效；选择“关闭浏览器后立即注销”时，关闭浏览器即自动退出。</p><form method="post" action="/" class="config-form session-form"><input type="hidden" name="action" value="set-session-duration"><label>保持时长<select name="sessionHours">${sessionOptions}</select></label><button class="primary-button" type="submit">保存登录状态</button></form></section></main><script>async function checkUuidAvailability(btn){var row=btn.closest('.uuid-row');var input=row.querySelector('input');var result=document.getElementById('uuid-check-result');var uuid=input.value.trim();result.className='uuid-result';result.textContent='检查中…';if(!/^[0-9]{6}$/.test(uuid)){result.textContent='UUID 必须是 6 位数字';result.className='uuid-result error';return false;}try{var res=await fetch('/?api=check-uuid&uuid='+encodeURIComponent(uuid));var data=await res.json();result.textContent=data.message;result.className='uuid-result '+(data.ok&&data.available?'success':'error');}catch(e){result.textContent='检查失败，请重试';result.className='uuid-result error';}return false;}</script></body></html>`);
 }
 
 async function adminAccountPage(request: Request, env: Env, account: WebdavAccount, newAppPassword = "", appPasswordError = ""): Promise<Response> {
@@ -3254,7 +3294,7 @@ td.check-col{text-align:center}
 .shares-section .card-heading{margin-bottom:12px}
 `;
 
-var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.storage-badge{display:flex;flex-direction:column;gap:5px;padding:12px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow);font-size:13px;color:var(--text-secondary);white-space:nowrap}.storage-badge strong{color:var(--text-primary);font-size:15px;letter-spacing:-.02em}.page-heading>.storage-badge{align-self:flex-start;margin-top:24px}`;
+var FORM_LAYOUT_CSS = `.icon-badge{width:auto;min-width:32px;padding:0 8px;white-space:nowrap;overflow:visible}.uuid-row{display:flex;gap:8px;align-items:center}.uuid-row input{flex:1;min-width:0;margin-top:0}.uuid-check-btn{margin:0;white-space:nowrap;height:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px;line-height:1}.uuid-result{display:block;margin-top:6px;font-size:12px}.uuid-result.error{color:#a43f35}.uuid-result.success{color:#176b48}.account-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}.account-actions .inline-button{display:inline-flex;align-items:center;justify-content:center;margin:0;height:44px;padding:0 18px;line-height:1}.account-actions .delete-account-form{margin:0}.account-actions .danger-button{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 18px;font-size:13px;font-weight:800;border-radius:4px}.storage-badge{display:flex;flex-direction:column;gap:5px;padding:12px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:7px;box-shadow:var(--card-shadow);font-size:13px;color:var(--text-secondary);white-space:nowrap}.storage-badge strong{color:var(--text-primary);font-size:15px;letter-spacing:-.02em}.page-heading>.storage-badge{align-self:flex-start;margin-top:24px}.session-card{margin-top:22px;padding:28px}.session-card .config-form{margin-top:18px;max-width:420px}.config-form select{display:block;width:100%;margin-top:7px;padding:13px 14px;border:1px solid var(--input-border);border-radius:2px;background:var(--input-bg);color:var(--text-primary);font:inherit;outline:none}.config-form select:focus{border-color:#4c8581;box-shadow:0 0 0 3px rgba(76,133,129,.14)}`;
 var TOPBAR_LAYOUT_CSS = `.topbar-inner{display:flex;align-items:center;justify-content:flex-start;gap:16px}.topbar-inner>.topbar-right,.topbar-inner>div:not(.brand):last-child,.topbar-inner>.text-link{margin-left:auto}.topbar-right{display:flex;align-items:center;justify-content:flex-end;gap:16px;flex-wrap:wrap}@media(max-width:720px){.topbar-right{gap:10px}}`;
 var LOGIN_DARK_CSS = `[data-theme="dark"] .login-panel{background:#182b2e;border-color:#345052;color:#c7d7d3}[data-theme="dark"] .login-panel h1,[data-theme="dark"] .login-panel label{color:#c7d7d3}[data-theme="dark"] .login-panel .muted{color:#91aaa4!important}[data-theme="dark"] .login-panel input{background:#122326;border-color:#3a5558;color:#c7d7d3}`;
 var THEME_TOGGLE_CSS = `.theme-toggle{appearance:none;-webkit-appearance:none;width:36px;height:36px;padding:0;border:0;border-radius:50%;background:transparent;box-shadow:none;color:currentColor;display:grid;place-items:center;cursor:pointer;font-size:17px;line-height:1;opacity:.86}.theme-toggle:hover{background:transparent;box-shadow:none;opacity:1;transform:scale(1.08)}.theme-toggle:focus-visible{outline:2px solid currentColor;outline-offset:3px}.login-shell>.theme-toggle{position:absolute;top:16px;right:20px;margin:0;z-index:10}`;
