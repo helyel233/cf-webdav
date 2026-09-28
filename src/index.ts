@@ -870,7 +870,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     // 超级管理员会话强制“关闭浏览器即注销”；普通用户自选（缺省 1 天）
     const sessionHours = credentials.role === "admin" ? 0 : credentials.sessionDurationHours ?? 24;
     const sessionTtl = sessionHours > 0 ? Math.max(3600, Math.round(sessionHours * 3600)) : SESSION_TTL;
-    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now() }), { expirationTtl: sessionTtl });
+    // exp 为绝对过期毫秒时间戳：KV TTL 可被刷新重写，绝对时间保证“保持时长”语义不被活跃请求延长
+    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now(), exp: Date.now() + sessionTtl * 1000 }), { expirationTtl: sessionTtl });
     await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
     const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/`;
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": sessionCookie } });
@@ -1042,10 +1043,10 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (currentToken && sessionRaw) {
         if (sessionHours > 0) {
           const ttl = Math.max(3600, Math.round(sessionHours * 3600));
-          await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, sessionRaw, { expirationTtl: ttl });
+          await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, JSON.stringify({ user: adminUsername, lastSeen: Date.now(), exp: Date.now() + ttl * 1000 }), { expirationTtl: ttl });
           return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${ttl}` } });
         }
-        await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, sessionRaw, { expirationTtl: SESSION_TTL });
+        await env.WEBDAV_KV.put(`${SESSION_PREFIX}${currentToken}`, JSON.stringify({ user: adminUsername, lastSeen: Date.now(), exp: Date.now() + SESSION_TTL * 1000 }), { expirationTtl: SESSION_TTL });
         return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": `cf_webdav_session=${currentToken}; HttpOnly; Secure; SameSite=Strict; Path=/` } });
       }
       return await adminPage(request, env, "登录状态已更新");
@@ -1430,11 +1431,11 @@ async function adminAccountsPage(request: Request, env: Env, adminUsername: stri
 }
 
 // 会话值兼容两种格式：旧版纯用户名字符串与新版 { user, lastSeen } JSON（支持空闲超时）
-function sessionValueOf(raw: string | null): { user: string; lastSeen: number } | null {
+function sessionValueOf(raw: string | null): { user: string; lastSeen: number; exp?: number } | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number };
-    if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen };
+    const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number; exp?: number };
+    if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen, exp: typeof parsed.exp === "number" ? parsed.exp : undefined };
   } catch { }
   return { user: raw, lastSeen: Date.now() };
 }
@@ -1445,15 +1446,21 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
   const session = sessionValueOf(await env.WEBDAV_KV.get(`${SESSION_PREFIX}${token}`));
   if (!session) return null;
   const idleSeconds = getSessionIdleSeconds(env);
+  // 绝对过期：到达用户自选的保持时长后强制重新登录（旧格式会话无 exp 字段，按原有行为处理）
+  if (session.exp && Date.now() > session.exp) {
+    await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
+    return null;
+  }
   if (idleSeconds > 0) {
     if (Date.now() - session.lastSeen > idleSeconds * 1000) {
       // 空闲超时：吊销会话要求重新登录
       await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
       return null;
     }
-    // 刷新活跃时间（1 分钟节流，避免每次页面请求都写 KV）
+    // 刷新活跃时间（1 分钟节流，避免每次页面请求都写 KV）；KV TTL 设为剩余秒数，不延长绝对过期
     if (Date.now() - session.lastSeen > 60_000) {
-      await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: session.user, lastSeen: Date.now() }), { expirationTtl: SESSION_TTL });
+      const remainSeconds = session.exp ? Math.max(60, Math.ceil((session.exp - Date.now()) / 1000)) : SESSION_TTL;
+      await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: session.user, lastSeen: Date.now(), exp: session.exp }), { expirationTtl: remainSeconds });
     }
   }
   return session.user;
