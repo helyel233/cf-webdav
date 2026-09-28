@@ -20,6 +20,7 @@ interface Env {
   MIN_PASSWORD_LENGTH?: string;
   // 会话空闲超时分钟数（0/缺省 = 不启用，会话固定 7 天）
   SESSION_IDLE_MINUTES?: string;
+  ADMIN_IDLE_MINUTES?: string;
   // 登录防爆破：窗口期内最大失败次数（默认 5）与锁定分钟数（默认 15）
   LOGIN_MAX_ATTEMPTS?: string;
   LOGIN_LOCK_MINUTES?: string;
@@ -248,6 +249,10 @@ function getMinPasswordLength(env: Env): number {
 function getSessionIdleSeconds(env: Env): number {
   // 0 = 不启用空闲超时，会话固定 7 天有效
   return intVarOf(env.SESSION_IDLE_MINUTES, 0, 0, 60 * 24 * 7) * 60;
+}
+function getAdminIdleSeconds(env: Env): number {
+  // 超级管理员强制空闲超时：页面关闭后心跳停止，超时即吊销会话（近似“关闭即注销”）；0 = 禁用
+  return intVarOf(env.ADMIN_IDLE_MINUTES, 5, 0, 1440) * 60;
 }
 function getLoginLockConfig(env: Env): { maxAttempts: number; windowSeconds: number } {
   return { maxAttempts: intVarOf(env.LOGIN_MAX_ATTEMPTS, 5, 1, 100), windowSeconds: intVarOf(env.LOGIN_LOCK_MINUTES, 15, 1, 1440) * 60 };
@@ -871,7 +876,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const sessionHours = credentials.role === "admin" ? 0 : credentials.sessionDurationHours ?? 24;
     const sessionTtl = sessionHours > 0 ? Math.max(3600, Math.round(sessionHours * 3600)) : SESSION_TTL;
     // exp 为绝对过期毫秒时间戳：KV TTL 可被刷新重写，绝对时间保证“保持时长”语义不被活跃请求延长
-    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now(), exp: Date.now() + sessionTtl * 1000 }), { expirationTtl: sessionTtl });
+    await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now(), exp: Date.now() + sessionTtl * 1000, role: credentials.role === "admin" ? "admin" : "user" }), { expirationTtl: sessionTtl });
     await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
     const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/`;
     return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": sessionCookie } });
@@ -1215,6 +1220,8 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   }
   // 数据可携带性：导出当前用户自己的元数据（资料、账户、访问日志、分享），不含文件内容与凭证
   if (url.searchParams.get("api") === "export-data" && request.method === "GET") return exportUserDataResponse(env, sessionUser_);
+  // 心跳：已登录页面定时调用，刷新 lastSeen 以维持空闲超时计时（页面关闭后心跳停止，超时即吊销）
+  if (url.searchParams.get("api") === "heartbeat" && request.method === "GET") return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
   // 新增：访问日志页面
   if (url.pathname === "/__admin/logs") {
     if (request.method !== "GET") return textResponse("Method Not Allowed", 405);
@@ -1405,7 +1412,7 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
     const limitGb = user.storageLimitBytes && user.storageLimitBytes > 0 ? (user.storageLimitBytes / 1024 ** 3) : 0;
     return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td>${usageByOwner.get(user.username) ?? "0.00"}</td><td><form method="post" class="limit-form"><input type="hidden" name="action" value="adjust-user-limit"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><input name="limitGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${limitGb}" title="GB，0 为默认 10 GB" aria-label="容量上限 GB">GB<button class="secondary-button compact-button" type="submit">设置</button></form><span class="muted limit-hint">0 = 默认 10 GB</span></td><td><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;white-space:nowrap"><input type="checkbox" name="purgeLogs" value="1">同时清除其访问与审计日志</label><button class="danger-button" type="submit">删除用户</button></form></td></tr>`;
   }).join("");
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body>${topbarHtml("超级管理员", `<span class="status-dot">系统管理员</span><a class="text-link inverse" href="/?view=audit">审计日志</a><a class="text-link inverse" href="/?action=logout">退出当前账户</a>`)}<main class="dashboard">${pageHeadingHtml("ADMINISTRATION", "用户与账户管理", "管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。", `<div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">当前已使用存储空间（GB）</th><th scope="col">容量上限（GB）</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="5" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}</script></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body>${topbarHtml("超级管理员", `<span class="status-dot">系统管理员</span><a class="text-link inverse" href="/?view=audit">审计日志</a><a class="text-link inverse" href="/?action=logout">退出当前账户</a>`)}<main class="dashboard">${pageHeadingHtml("ADMINISTRATION", "用户与账户管理", "管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。", `<div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">当前已使用存储空间（GB）</th><th scope="col">容量上限（GB）</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="5" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}setInterval(function(){fetch('/?api=heartbeat',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)location.reload()}).catch(function(){location.reload()})},60000);</script></body></html>`);
 }
 
 async function adminLandingPage(request: Request, env: Env, adminUsername: string, accounts: WebdavAccount[], nextUuid: string, message: string, usedStorage: number): Promise<Response> {
@@ -1440,11 +1447,11 @@ async function adminAccountsPage(request: Request, env: Env, adminUsername: stri
 }
 
 // 会话值兼容两种格式：旧版纯用户名字符串与新版 { user, lastSeen } JSON（支持空闲超时）
-function sessionValueOf(raw: string | null): { user: string; lastSeen: number; exp?: number } | null {
+function sessionValueOf(raw: string | null): { user: string; lastSeen: number; exp?: number; role?: "admin" | "user" } | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number; exp?: number };
-    if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen, exp: typeof parsed.exp === "number" ? parsed.exp : undefined };
+    const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number; exp?: number; role?: "admin" | "user" };
+    if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen, exp: typeof parsed.exp === "number" ? parsed.exp : undefined, role: parsed.role === "admin" ? "admin" : undefined };
   } catch { }
   return { user: raw, lastSeen: Date.now() };
 }
@@ -1454,7 +1461,12 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
   if (!token) return null;
   const session = sessionValueOf(await env.WEBDAV_KV.get(`${SESSION_PREFIX}${token}`));
   if (!session) return null;
-  const idleSeconds = getSessionIdleSeconds(env);
+  let idleSeconds = getSessionIdleSeconds(env);
+  // 超级管理员强制空闲超时（心跳停止即倒数）：页面关闭后自动吊销，近似“关闭即注销”
+  if (session.role === "admin") {
+    const adminIdle = getAdminIdleSeconds(env);
+    if (adminIdle > 0) idleSeconds = idleSeconds > 0 ? Math.min(idleSeconds, adminIdle) : adminIdle;
+  }
   // 绝对过期：到达用户自选的保持时长后强制重新登录（旧格式会话无 exp 字段，按原有行为处理）
   if (session.exp && Date.now() > session.exp) {
     await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
