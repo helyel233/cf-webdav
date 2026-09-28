@@ -554,6 +554,10 @@ interface AdminAccount extends Credentials {
   ipAllowlist?: string[];
   // 登录状态保持时长（小时）：168=7天/72=3天/24=1天/12/1；0=关闭浏览器即注销；普通用户缺省 24，超级管理员强制 0
   sessionDurationHours?: number;
+  // 超管重置密码后置位：未改密前登录仅可访问改密页，改密成功清除
+  mustChangePassword?: boolean;
+  // TOTP 恢复码（SHA-256 十六进制哈希，每个仅可用一次，明文只在生成时展示一次）
+  recoveryCodes?: string[];
 }
 
 interface AppPasswordEntry {
@@ -742,6 +746,57 @@ async function revokeUserSessions(env: Env, username: string): Promise<void> {
   await Promise.all(doomed);
 }
 
+// 同一账户并发活跃会话上限：登录后超出则吊销最旧的会话（防凭证扩散）
+const MAX_SESSIONS_PER_USER = 5;
+async function limitUserSessions(env: Env, username: string, max: number = MAX_SESSIONS_PER_USER): Promise<void> {
+  const sessions = await env.WEBDAV_KV.list({ prefix: SESSION_PREFIX });
+  const owned: Array<{ name: string; lastSeen: number }> = [];
+  for (const key of sessions.keys) {
+    const session = sessionValueOf(await env.WEBDAV_KV.get(key.name));
+    if (session?.user === username) owned.push({ name: key.name, lastSeen: session.lastSeen });
+  }
+  if (owned.length <= max) return;
+  owned.sort((a, b) => a.lastSeen - b.lastSeen);
+  await Promise.all(owned.slice(0, owned.length - max).map((item) => env.WEBDAV_KV.delete(item.name)));
+}
+
+// 列出指定用户当前全部活跃会话（按最后活跃时间倒序；name 为完整 KV 键，便于精准吊销）
+async function listUserSessions(env: Env, username: string): Promise<Array<{ name: string; lastSeen: number; exp?: number }>> {
+  const sessions = await env.WEBDAV_KV.list({ prefix: SESSION_PREFIX });
+  const owned: Array<{ name: string; lastSeen: number; exp?: number }> = [];
+  for (const key of sessions.keys) {
+    const session = sessionValueOf(await env.WEBDAV_KV.get(key.name));
+    if (session?.user === username) owned.push({ name: key.name, lastSeen: session.lastSeen, exp: session.exp });
+  }
+  return owned.sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bits = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(bits)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// 生成 10 个 8 位十六进制恢复码（明文仅展示一次，服务端只存 SHA-256 哈希）
+function generateRecoveryCodes(): string[] {
+  return Array.from({ length: 10 }, () => [...crypto.getRandomValues(new Uint8Array(4))].map((byte) => byte.toString(16).padStart(2, "0")).join(""));
+}
+
+// 登录时尝试消费一个恢复码：匹配即从账户表移除该哈希并放行
+async function consumeRecoveryCode(env: Env, username: string, code: string): Promise<boolean> {
+  const normalized = code.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}$/.test(normalized)) return false;
+  const hash = await sha256Hex(normalized);
+  let consumed = false;
+  await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
+    const account = accounts[username];
+    if (!account?.recoveryCodes?.includes(hash)) return "恢复码不匹配";
+    accounts[username] = { ...account, recoveryCodes: account.recoveryCodes.filter((item) => item !== hash) };
+    consumed = true;
+    return null;
+  });
+  return consumed;
+}
+
 function webdavAccountUrl(request: Request, account: WebdavAccount): string {
   return `${new URL(request.url).origin}/${encodeURIComponent(account.owner)}/${account.uuid}`;
 }
@@ -864,10 +919,13 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
       return adminLoginPage("当前 IP 不在该账户的访问白名单内");
     }
-    // TOTP 两步验证：已绑定的账户需输入验证器动态码
-    if (credentials.totpSecret && !(await verifyTotp(credentials.totpSecret, String(form.get("totpCode") || "")))) {
-      if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
-      return adminLoginPage("两步验证码错误或已过期");
+    // TOTP 两步验证：已绑定的账户需输入验证器动态码；动态码错误时尝试一次性恢复码
+    if (credentials.totpSecret) {
+      const totpCode = String(form.get("totpCode") || "");
+      if (!(await verifyTotp(credentials.totpSecret, totpCode)) && !(await consumeRecoveryCode(env, username, totpCode))) {
+        if (!(await checkAuthAttempts(env, `login:${loginIp}:${username}`, lock.maxAttempts, lock.windowSeconds))) return adminLoginPage(lockMessage);
+        return adminLoginPage("两步验证码错误或已过期");
+      }
     }
     // 会话记录最后活跃时间（支持 SESSION_IDLE_MINUTES 空闲超时）；保持时长由用户在用户管理页自选
     const token = bytesToBase64(crypto.getRandomValues(new Uint8Array(32)));
@@ -877,9 +935,13 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
     const sessionTtl = sessionHours > 0 ? Math.max(3600, Math.round(sessionHours * 3600)) : SESSION_TTL;
     // exp 为绝对过期毫秒时间戳：KV TTL 可被刷新重写，绝对时间保证“保持时长”语义不被活跃请求延长
     await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: username, lastSeen: Date.now(), exp: Date.now() + sessionTtl * 1000, role: credentials.role === "admin" ? "admin" : "user" }), { expirationTtl: sessionTtl });
+    // 并发会话上限：超出则吊销最旧会话
+    await limitUserSessions(env, username);
     await logAudit(env, { actor: username, action: "login", target: username, clientIp: loginIp });
-    const sessionCookie = sessionHours > 0 ? `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${sessionTtl}` : `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/`;
-    return new Response(null, { status: 303, headers: { Location: "/", "Set-Cookie": sessionCookie } });
+    // 超管重置过密码的账户：登录后强制进入改密页
+    const loginRedirect = credentials.mustChangePassword ? "/?view=change-password" : "/";
+    const sessionCookie = `cf_webdav_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/${sessionHours > 0 ? `; Max-Age=${sessionTtl}` : ""}`;
+    return new Response(null, { status: 303, headers: { Location: loginRedirect, "Set-Cookie": sessionCookie } });
   }
   // 会话诊断：展示当前请求是否携带 Cookie 与服务端会话状态，用于定位“Cookie 存在但仍要求登录”类问题
   const sessionUser_ = await sessionUser(request, env);
@@ -889,9 +951,13 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
   if (sessionAccount && !ipAllowed(clientIpOf(request), sessionAccount.ipAllowlist ?? [])) return textResponse("Forbidden: 当前 IP 不在该账户的访问白名单内", 403);
   if (sessionAccount?.role === "admin") return superAdminRequest(request, env, sessionAccount);
   const view = url.searchParams.get("view") || "home";
+  // 强制改密门禁：超管重置过密码的账户，改密成功前仅可访问安全设置页
+  if (sessionAccount?.mustChangePassword && view !== "change-password") {
+    return new Response(null, { status: 303, headers: { Location: "/?view=change-password" } });
+  }
   // 新增：用户级修改密码页面（需校验当前密码，仅普通用户可用）
   if (request.method === "GET" && view === "change-password") {
-    return adminChangePasswordPage(env, sessionUser_);
+    return adminChangePasswordPage(env, sessionUser_, "", "", "", [], sessionToken(request) ?? "");
   }
   if (request.method === "POST" && (isRoot || url.pathname === "/__admin") && view === "change-password") {
     const form = await request.formData();
@@ -908,7 +974,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
         const account = accounts[sessionUser_];
         if (!account) return "账户不存在";
         const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
-        accounts[sessionUser_] = { ...account, username: sessionUser_, salt, passwordHash: await hashPassword(newPassword, salt) };
+        accounts[sessionUser_] = { ...account, username: sessionUser_, salt, passwordHash: await hashPassword(newPassword, salt), mustChangePassword: undefined };
         return null;
       });
       if (changeError) return adminChangePasswordPage(env, sessionUser_, "", changeError);
@@ -924,14 +990,17 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const secret = await env.WEBDAV_KV.get(`${TOTP_PENDING_PREFIX}${sessionUser_}`);
       if (!secret) return adminChangePasswordPage(env, sessionUser_, "", "绑定会话已过期，请重新新增令牌");
       if (!(await verifyTotp(secret, String(form.get("totpCode") || "")))) return adminChangePasswordPage(env, sessionUser_, "", "验证码错误，请确认验证器时间与密钥后重试", secret);
+      // 每次绑定生成 10 个一次性恢复码：服务端只存 SHA-256 哈希，明文仅在绑定成功的响应中展示一次
+      const recoveryCodes = generateRecoveryCodes();
+      const recoveryHashes = await Promise.all(recoveryCodes.map((code) => sha256Hex(code)));
       const bindError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
         const account = accounts[sessionUser_];
         if (!account) return "账户不存在";
-        accounts[sessionUser_] = { ...account, totpSecret: secret };
+        accounts[sessionUser_] = { ...account, totpSecret: secret, recoveryCodes: recoveryHashes };
         return null;
       });
       await env.WEBDAV_KV.delete(`${TOTP_PENDING_PREFIX}${sessionUser_}`);
-      return bindError ? adminChangePasswordPage(env, sessionUser_, "", bindError) : adminChangePasswordPage(env, sessionUser_, "TOTP 令牌已绑定，下次登录需输入验证器动态码");
+      return bindError ? adminChangePasswordPage(env, sessionUser_, "", bindError) : adminChangePasswordPage(env, sessionUser_, "TOTP 令牌已绑定，下次登录需输入验证器动态码", "", "", recoveryCodes, sessionToken(request) ?? "");
     } else if (String(form.get("action") || "") === "totp-disable") {
       const current = (await getAdminAccounts(env))[sessionUser_];
       if (!current?.totpSecret) return adminChangePasswordPage(env, sessionUser_, "", "尚未启用两步验证");
@@ -939,10 +1008,18 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const disableError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
         const account = accounts[sessionUser_];
         if (!account) return "账户不存在";
-        accounts[sessionUser_] = { ...account, totpSecret: undefined };
+        accounts[sessionUser_] = { ...account, totpSecret: undefined, recoveryCodes: undefined };
         return null;
       });
       return disableError ? adminChangePasswordPage(env, sessionUser_, "", disableError) : adminChangePasswordPage(env, sessionUser_, "TOTP 令牌已删除，登录仅需密码");
+    } else if (String(form.get("action") || "") === "logout-others") {
+      // 活跃会话管理：保留当前会话，吊销该用户其余全部会话
+      const currentToken = sessionToken(request) ?? "";
+      const sessions = await listUserSessions(env, sessionUser_);
+      const others = sessions.filter((session) => session.name !== `${SESSION_PREFIX}${currentToken}`);
+      await Promise.all(others.map((session) => env.WEBDAV_KV.delete(session.name)));
+      await logAudit(env, { actor: sessionUser_, action: "logout-others", target: sessionUser_, clientIp: clientIpOf(request), detail: `吊销 ${others.length} 个其他会话` });
+      return adminChangePasswordPage(env, sessionUser_, others.length ? `已登出其他 ${others.length} 个会话` : "当前没有其他活跃会话", "", "", [], currentToken);
     }
   }
   // 账户安全设置：TOTP 两步验证绑定/解绑 + IP 白名单
@@ -960,15 +1037,18 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const secret = await env.WEBDAV_KV.get(`${TOTP_PENDING_PREFIX}${sessionUser_}`);
       if (!secret) return securityPage(request, env, sessionUser_, { error: "绑定会话已过期，请重新生成密钥" });
       if (!(await verifyTotp(secret, String(form.get("totpCode") || "")))) return securityPage(request, env, sessionUser_, { pendingSecret: secret, error: "验证码错误，请确认验证器时间与密钥后重试" });
+      // 每次绑定生成 10 个一次性恢复码：服务端只存 SHA-256 哈希，明文仅在绑定成功的响应中展示一次
+      const recoveryCodes = generateRecoveryCodes();
+      const recoveryHashes = await Promise.all(recoveryCodes.map((code) => sha256Hex(code)));
       const bindError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
         const account = accounts[sessionUser_];
         if (!account) return "账户不存在";
-        accounts[sessionUser_] = { ...account, totpSecret: secret };
+        accounts[sessionUser_] = { ...account, totpSecret: secret, recoveryCodes: recoveryHashes };
         return null;
       });
       await env.WEBDAV_KV.delete(`${TOTP_PENDING_PREFIX}${sessionUser_}`);
       if (!bindError) await logAudit(env, { actor: sessionUser_, action: "totp-enable", target: sessionUser_, clientIp: clientIpOf(request) });
-      return bindError ? securityPage(request, env, sessionUser_, { error: bindError }) : securityPage(request, env, sessionUser_, { message: "两步验证已启用，下次登录需输入验证器动态码" });
+      return bindError ? securityPage(request, env, sessionUser_, { error: bindError }) : securityPage(request, env, sessionUser_, { message: "两步验证已启用， 下次登录需输入验证器动态码", recoveryCodes });
     }
     if (securityAction === "totp-disable") {
       const current = (await getAdminAccounts(env))[sessionUser_];
@@ -977,7 +1057,7 @@ async function adminRequest(request: Request, env: Env): Promise<Response> {
       const disableError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (accounts) => {
         const account = accounts[sessionUser_];
         if (!account) return "账户不存在";
-        accounts[sessionUser_] = { ...account, totpSecret: undefined };
+        accounts[sessionUser_] = { ...account, totpSecret: undefined, recoveryCodes: undefined };
         return null;
       });
       if (!disableError) await logAudit(env, { actor: sessionUser_, action: "totp-disable", target: sessionUser_, clientIp: clientIpOf(request) });
@@ -1343,6 +1423,41 @@ async function superAdminRequest(request: Request, env: Env, currentAdmin: Admin
     await logAudit(env, { actor: currentAdmin.username, action: "delete-user", target: username, clientIp: clientIpOf(request), detail: purgeLogs ? "已同步清除访问日志与审计记录" : "" });
     return superAdminPage(env, "用户及其 WebDAV 账户已删除");
   }
+  if (action === "reset-user-password") {
+    const username = String(form.get("userUsername") || "");
+    const target = accounts[username];
+    if (!target || target.role === "admin") return superAdminPage(env, "只能为普通用户重置密码");
+    // 生成 12 位随机临时密码（去除易混淆字符，必满足密码策略），仅在本次响应中展示一次
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    const tempPassword = [...crypto.getRandomValues(new Uint8Array(12))].map((byte) => alphabet[byte % alphabet.length]).join("");
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+    const resetError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (table) => {
+      const account = table[username];
+      if (!account) return "账户不存在";
+      table[username] = { ...account, salt, passwordHash: await hashPassword(tempPassword, salt), mustChangePassword: true };
+      return null;
+    });
+    if (resetError) return superAdminPage(env, resetError);
+    await revokeUserSessions(env, username);
+    await logAudit(env, { actor: currentAdmin.username, action: "reset-user-password", target: username, clientIp: clientIpOf(request) });
+    return superAdminPage(env, `已重置 ${username} 的密码，临时密码：${tempPassword}（仅本次显示，请立即复制发给用户；该用户下次登录将被强制要求修改密码，且其全部会话已吊销）`);
+  }
+  if (action === "reset-totp") {
+    const username = String(form.get("userUsername") || "");
+    const target = accounts[username];
+    if (!target || target.role === "admin") return superAdminPage(env, "只能重置普通用户的两步验证");
+    if (!target.totpSecret) return superAdminPage(env, "该用户未启用两步验证");
+    const resetError = await mutateAccountTable<AdminAccount>(env, ADMIN_ACCOUNTS_KEY, () => getAdminAccounts(env), async (table) => {
+      const account = table[username];
+      if (!account) return "账户不存在";
+      table[username] = { ...account, totpSecret: undefined, recoveryCodes: undefined };
+      return null;
+    });
+    if (resetError) return superAdminPage(env, resetError);
+    await revokeUserSessions(env, username);
+    await logAudit(env, { actor: currentAdmin.username, action: "reset-totp", target: username, clientIp: clientIpOf(request) });
+    return superAdminPage(env, `已重置 ${username} 的两步验证：TOTP 令牌与恢复码已清除，其全部会话已吊销，用户重新登录后可重新绑定`);
+  }
   if (action === "adjust-user-limit") {
     const username = String(form.get("userUsername") || "");
     const target = accounts[username];
@@ -1402,7 +1517,7 @@ async function superAdminPage(env: Env, message: string): Promise<Response> {
     const ownedAccounts = Object.values(webdavAccounts).filter((account) => account.owner === user.username);
     const accountRows = ownedAccounts.map((account) => `<div class="account-row"><span>${escapeHtml(account.username)} · ${escapeHtml(account.uuid || "------")} · 配额 ${account.quotaBytes && account.quotaBytes > 0 ? `${(account.quotaBytes / 1024 ** 3).toFixed(1)} GB` : "不限"}</span><form method="post" class="quota-form"><input type="hidden" name="action" value="adjust-dav-quota"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><input name="quotaGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${account.quotaBytes && account.quotaBytes > 0 ? (account.quotaBytes / 1024 ** 3) : 0}" title="GB，0 为不限制" aria-label="配额 GB"><button class="secondary-button compact-button" type="submit">设配额</button></form><form method="post" style="display:inline" onsubmit="return confirm('确定删除此 WebDAV 账户及其全部文件吗？')"><input type="hidden" name="action" value="delete-webdav-admin"><input type="hidden" name="serviceUsername" value="${escapeHtml(account.username)}"><button class="danger-button compact-button" type="submit">删除</button></form></div>`).join("");
     const limitGb = user.storageLimitBytes && user.storageLimitBytes > 0 ? (user.storageLimitBytes / 1024 ** 3) : 0;
-    return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td>${usageByOwner.get(user.username) ?? "0.00"}</td><td><form method="post" class="limit-form"><input type="hidden" name="action" value="adjust-user-limit"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><input name="limitGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${limitGb}" title="GB，0 为默认 10 GB" aria-label="容量上限 GB">GB<button class="secondary-button compact-button" type="submit">设置</button></form><span class="muted limit-hint">0 = 默认 10 GB</span></td><td><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;white-space:nowrap"><input type="checkbox" name="purgeLogs" value="1">同时清除其访问与审计日志</label><button class="danger-button" type="submit">删除用户</button></form></td></tr>`;
+    return `<tr class="user-row" data-search="${escapeHtml(`${user.username} ${ownedAccounts.map((account) => account.username).join(" ")}`.toLowerCase())}"><th scope="row">${escapeHtml(user.username)}</th><td><div class="account-list">${accountRows || '<span class="muted">暂无 WebDAV 账户</span>'}</div></td><td>${usageByOwner.get(user.username) ?? "0.00"}</td><td><form method="post" class="limit-form"><input type="hidden" name="action" value="adjust-user-limit"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><input name="limitGb" type="number" min="0" max="${USER_LIMIT_MAX_GB}" step="0.1" value="${limitGb}" title="GB，0 为默认 10 GB" aria-label="容量上限 GB">GB<button class="secondary-button compact-button" type="submit">设置</button></form><span class="muted limit-hint">0 = 默认 10 GB</span></td><td><div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start"><form method="post" onsubmit="return confirm('确定重置该用户的密码吗？将生成一次性临时密码并吊销其全部会话。')"><input type="hidden" name="action" value="reset-user-password"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><button class="secondary-button compact-button" type="submit">重置密码</button></form><form method="post" onsubmit="return confirm('确定重置该用户的两步验证吗？将清除 TOTP 令牌与恢复码并吊销其全部会话。')"><input type="hidden" name="action" value="reset-totp"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><button class="secondary-button compact-button" type="submit">重置两步验证</button></form><form method="post" onsubmit="return confirm('确定删除该用户及其全部 WebDAV 账户和文件吗？此操作不可恢复！')"><input type="hidden" name="action" value="delete-user"><input type="hidden" name="userUsername" value="${escapeHtml(user.username)}"><label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;white-space:nowrap"><input type="checkbox" name="purgeLogs" value="1">同时清除其访问与审计日志</label><button class="danger-button" type="submit">删除用户</button></form></div></td></tr>`;
   }).join("");
   return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>超级管理员</title><style>${ADMIN_CSS}${USER_TABLE_CSS}${FILES_CSS}</style><body>${topbarHtml("超级管理员", `<span class="status-dot">系统管理员</span><a class="text-link inverse" href="/?view=audit">审计日志</a>${env.ENABLE_ACCESS_LOG === "true" ? `<a class="text-link inverse" href="/__admin/logs">访问日志</a>` : ""}<a class="text-link inverse" href="/?action=logout">退出当前账户</a>`)}<main class="dashboard">${pageHeadingHtml("ADMINISTRATION", "用户与账户管理", "管理员只能管理用户和 WebDAV 账户信息，无法查看任何文件内容。", `<div class="storage-badge"><span>当前所有用户已用容量（GB）：<strong>${usedGb}</strong></span></div>`)}${message ? `<div class="notice success">${escapeHtml(message)}</div>` : ""}<section class="content-grid"><article class="config-card"><div class="card-heading"><div><p class="eyebrow">NEW USER</p><h2>创建用户</h2></div><span class="icon-badge">01</span></div><form method="post" class="config-form"><input type="hidden" name="action" value="create-user"><label>用户账户<input name="userUsername" autocomplete="username" required></label><label>密码<input name="userPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认密码<input name="userPasswordConfirm" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">创建用户</button></form></article></section><section class="config-card user-table-card"><div class="card-heading"><div><p class="eyebrow">USER DIRECTORY</p><h2>用户列表</h2></div><span class="icon-badge">${users.length}</span></div><label class="filter-label" for="user-filter">筛选用户或 WebDAV 账户<input id="user-filter" type="search" placeholder="输入名称筛选" oninput="filterUsers(this.value)"></label><div class="table-scroll"><table class="user-table"><thead><tr><th scope="col">用户</th><th scope="col">WebDAV 账户</th><th scope="col">当前已使用存储空间（GB）</th><th scope="col">容量上限（GB）</th><th scope="col">操作</th></tr></thead><tbody id="user-table-body">${userRows || '<tr><td colspan="5" class="muted empty-cell">暂无用户。</td></tr>'}</tbody></table></div><p id="user-filter-empty" class="muted empty-cell" hidden>没有匹配的用户。</p></section></main><script>function filterUsers(value){const query=value.trim().toLowerCase();let visible=0;document.querySelectorAll('.user-row').forEach((row)=>{const matched=!query||row.dataset.search.includes(query);row.hidden=!matched;if(matched)visible+=1;});document.getElementById('user-filter-empty').hidden=visible>0||!query;}setInterval(function(){fetch('/?api=heartbeat',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)location.reload()}).catch(function(){location.reload()})},60000);</script></body></html>`);
 }
@@ -1445,7 +1560,9 @@ function sessionValueOf(raw: string | null): { user: string; lastSeen: number; e
     const parsed = JSON.parse(raw) as { user?: string; lastSeen?: number; exp?: number; role?: "admin" | "user" };
     if (parsed?.user && typeof parsed.lastSeen === "number") return { user: parsed.user, lastSeen: parsed.lastSeen, exp: typeof parsed.exp === "number" ? parsed.exp : undefined, role: parsed.role === "admin" ? "admin" : undefined };
   } catch { }
-  return { user: raw, lastSeen: Date.now() };
+  // 旧格式会话（纯用户名字符串）无真实活跃时间：记 0（最旧），避免在会话限额排序中被
+  // 误判为“刚刚活跃”而挤掉真实会话；后续访问会将其升级为新格式或被优先清理
+  return { user: raw, lastSeen: 0 };
 }
 
 async function sessionUser(request: Request, env: Env): Promise<string | null> {
@@ -1933,21 +2050,30 @@ async function adminFilesPage(request: Request, env: Env, account: WebdavAccount
 }
 
 function adminLoginPage(error = ""): Response {
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="notice success">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><label>两步验证码（未启用可留空）<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字"></label><button class="primary-button" type="submit">登录管理后台</button></form><a class="secondary-button register-button" href="/__admin/register">注册新用户</a></section></main>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WebDAV 管理登录</title><style>${ADMIN_CSS}</style><main class="login-shell"><section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">CLOUD STORAGE</p><h1>WebDAV 管理</h1><p class="muted">登录后管理账号、访问日志和文件。</p>${error ? `<p class="notice success">${escapeXml(error)}</p>` : ""}<form method="post" action="/__admin/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><label>两步验证码（未启用可留空，支持恢复码）<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码或 8 位恢复码"></label><button class="primary-button" type="submit">登录管理后台</button></form><a class="secondary-button register-button" href="/__admin/register">注册新用户</a></section></main>`);
 }
 
 // 新增：用户级修改密码页面（需校验当前密码）；同时内嵌 TOTP 令牌管理卡片（新增/删除/打开两步验证设置）
-async function adminChangePasswordPage(env: Env, sessionUser: string, message = "", error = "", pendingSecret = ""): Promise<Response> {
+async function adminChangePasswordPage(env: Env, sessionUser: string, message = "", error = "", pendingSecret = "", recoveryCodes: string[] = [], currentToken = ""): Promise<Response> {
   const account = (await getAdminAccounts(env))[sessionUser];
   const totpEnabled = Boolean(account?.totpSecret);
   if (!pendingSecret) pendingSecret = (await env.WEBDAV_KV.get(`${TOTP_PENDING_PREFIX}${sessionUser}`)) ?? "";
+  // 活跃会话列表：按最后活跃时间倒序，标记当前会话
+  const sessionList = await listUserSessions(env, sessionUser);
+  const sessionItems = sessionList.map((session) => {
+    const isCurrent = currentToken && session.name === `${SESSION_PREFIX}${currentToken}`;
+    const remainingHours = session.exp ? Math.max(0, Math.round((session.exp - Date.now()) / 3600000)) : null;
+    return `<li style="display:flex;flex-direction:column;gap:2px;padding:10px 12px;border:1px solid var(--card-border,#dfe7e4);border-radius:8px"><strong>${isCurrent ? "本会话（当前设备）" : "其他会话"}</strong><span class="muted">最后活跃：${new Date(session.lastSeen).toLocaleString("zh-CN")}${remainingHours !== null ? ` · 约 ${remainingHours} 小时后过期` : ""}</span></li>`;
+  }).join("");
+  const recoveryPanel = recoveryCodes.length ? `<section class="login-panel"><p class="eyebrow">RECOVERY CODES</p><h1>恢复码</h1><p class="muted">验证器不可用时，可在登录页的两步验证码输入框中输入任一恢复码登录。每个恢复码仅可使用一次，且<strong>仅本次显示</strong>，请立即保存到安全的地方。</p><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;font-size:16px;letter-spacing:1px">${recoveryCodes.map((code) => `<code>${code}</code>`).join("")}</div></section>` : "";
+  const sessionsPanel = `<section class="login-panel"><p class="eyebrow">ACTIVE SESSIONS</p><h1>活跃会话</h1><p class="muted">当前共 ${sessionList.length} 个活跃会话（同一账户最多同时保留 5 个，超出时最早登录的会话会被自动吊销）。修改密码或退出会吊销全部会话。</p><ul style="list-style:none;padding:0;margin:0 0 14px;display:flex;flex-direction:column;gap:10px">${sessionItems}</ul><form method="post" action="/?view=change-password"><input type="hidden" name="action" value="logout-others"><button class="secondary-button" type="submit" onclick="return confirm('确定登出其他所有设备吗？当前设备保持登录。')">登出其他设备</button></form></section>`;
   const pwPanel = `<section class="login-panel"><div class="brand-mark">WD</div><p class="eyebrow">ACCOUNT SECURITY</p><h1>安全设置</h1><p class="muted">为保障账户安全，修改密码前需要先验证当前密码。</p>${message ? `<p class="notice success">${escapeXml(message)}</p>` : ""}${error ? `<p class="error">${escapeXml(error)}</p>` : ""}<form method="post" action="/?view=change-password"><input type="hidden" name="action" value="change-own-password"><label>当前密码<input name="currentPassword" type="password" autocomplete="current-password" required></label><label>新密码<input name="newPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></label><label>确认新密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></label><button class="primary-button" type="submit">保存新密码</button></form></section>`;
   const totpPanel = `<section class="login-panel totp-panel"><p class="eyebrow">TWO-FACTOR</p><h1>TOTP 令牌</h1><p class="muted">新增令牌后，登录除密码外还需输入验证器动态码。支持 Google Authenticator、1Password 等标准验证器。当前状态：<strong>${totpEnabled ? "已启用" : "未启用"}</strong></p>${error ? `<p class="error">${escapeXml(error)}</p>` : ""}${message ? `<p class="notice success">${escapeXml(message)}</p>` : ""}${totpEnabled ? `<form method="post" action="/?view=change-password"><input type="hidden" name="action" value="totp-disable"><label>输入当前验证码以删除令牌<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字" required></label><button class="danger-button totp-button" type="submit" onclick="return confirm('确定删除 TOTP 令牌吗？删除后登录仅需密码。')">删除 TOTP 令牌</button></form>` : pendingSecret ? `<p><strong>密钥（手动输入用）：</strong><code>${escapeXml(pendingSecret)}</code></p><p class="muted">或在验证器中添加以下 URI：</p><p class="totp-uri"><code>${escapeXml(`otpauth://totp/WebDAV:${encodeURIComponent(sessionUser)}?secret=${pendingSecret}&issuer=WebDAV`)}</code></p><form method="post" action="/?view=change-password"><input type="hidden" name="action" value="totp-setup-confirm"><label>输入验证器显示的 6 位动态码确认绑定<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字" required></label><button class="primary-button" type="submit">确认绑定</button></form>` : `<form method="post" action="/?view=change-password"><input type="hidden" name="action" value="totp-setup-start"><button class="primary-button" type="submit">新增 TOTP 令牌</button></form>`}<a class="secondary-button inline-button totp-open" href="/?view=security">打开两步验证设置</a></section>`;
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全设置</title><style>${ADMIN_CSS}${CHANGE_PW_CSS}</style><body>${topbarHtml("安全设置", `<a class="text-link inverse" href="/">返回首页</a>`)}<main class="login-shell"><div class="pw-grid">${pwPanel}${totpPanel}</div></main></body></html>`);
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全设置</title><style>${ADMIN_CSS}${CHANGE_PW_CSS}</style><body>${topbarHtml("安全设置", `<a class="text-link inverse" href="/">返回首页</a>`)}<main class="login-shell"><div class="pw-grid">${pwPanel}${totpPanel}${recoveryPanel}${sessionsPanel}</div></main></body></html>`);
 }
 
 // 账户安全设置页：TOTP 两步验证（生成/确认/解绑）+ IP 白名单（登录与 WebDAV 共用）
-async function securityPage(request: Request, env: Env, sessionUser: string, extra: { message?: string; error?: string; pendingSecret?: string } = {}): Promise<Response> {
+async function securityPage(request: Request, env: Env, sessionUser: string, extra: { message?: string; error?: string; pendingSecret?: string; recoveryCodes?: string[] } = {}): Promise<Response> {
   const account = (await getAdminAccounts(env))[sessionUser];
   const totpEnabled = Boolean(account?.totpSecret);
   const pendingSecret = extra.pendingSecret ?? "";
@@ -1956,7 +2082,8 @@ async function securityPage(request: Request, env: Env, sessionUser: string, ext
   const textareaStyle = "display:block;width:100%;min-height:110px;margin-top:7px;padding:13px 14px;border:1px solid #cbd7d3;border-radius:2px;background:#fbfcfa;color:#17212b;font:inherit;outline:none";
   const totpCard = `<article class="config-card"><div class="card-heading"><div><p class="eyebrow">TWO-FACTOR</p><h2>TOTP 两步验证</h2></div><span class="icon-badge">${totpEnabled ? "ON" : "OFF"}</span></div><p class="muted">绑定后登录管理后台除密码外还需输入验证器动态码，防止密码泄露后被异地登录。支持 Google Authenticator、1Password 等标准验证器。</p>${extra.error ? `<p class="error">${escapeHtml(extra.error)}</p>` : ""}${extra.message ? `<p class="notice success">${escapeHtml(extra.message)}</p>` : ""}${totpEnabled ? `<form method="post" action="/?view=security" class="config-form"><input type="hidden" name="action" value="totp-disable"><label>输入当前验证码以解除绑定<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字" required></label><button class="danger-button" type="submit" onclick="return confirm('确定解除两步验证吗？解除后登录仅需密码。')">解除绑定</button></form>` : pendingSecret ? `<div class="config-form"><p><strong>密钥（手动输入用）：</strong><code>${escapeHtml(pendingSecret)}</code></p><p class="muted">或在验证器中添加以下 URI：</p><p class="totp-uri"><code>${escapeHtml(`otpauth://totp/WebDAV:${encodeURIComponent(sessionUser)}?secret=${pendingSecret}&issuer=WebDAV`)}</code></p><form method="post" action="/?view=security"><input type="hidden" name="action" value="totp-setup-confirm"><label>输入验证器显示的 6 位动态码确认绑定<input name="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字" required></label><button class="primary-button" type="submit">确认绑定</button></form></div>` : `<form method="post" action="/?view=security" class="config-form"><input type="hidden" name="action" value="totp-setup-start"><button class="primary-button" type="submit">生成密钥并开始绑定</button></form>`}</article>`;
   const allowlistCard = `<article class="config-card"><div class="card-heading"><div><p class="eyebrow">IP ALLOWLIST</p><h2>IP 白名单</h2></div><span class="icon-badge">${allowlist.length || "∞"}</span></div><p class="muted">限制管理后台登录与 WebDAV 访问的来源 IP。每行一条，支持精确 IP（1.2.3.4）、IPv4 前缀（1.2.3. 或 1.2.）与 CIDR（1.2.3.0/24）。留空表示不限制。当前来源 IP：<code>${escapeHtml(clientIp)}</code>${clientIp === "unknown" ? "（本地开发环境无法获取真实 IP，配置后登录可能被拒绝）" : ""}</p>${allowlist.length ? `<p class="muted">当前规则：${allowlist.map((entry) => `<code>${escapeHtml(entry)}</code>`).join("、")}</p>` : ""}<form method="post" action="/?view=security" class="config-form"><input type="hidden" name="action" value="ip-allowlist-save"><label>白名单（每行一条，留空清空）<textarea name="allowlist" style="${textareaStyle}" spellcheck="false" placeholder="1.2.3.4&#10;1.2.3.&#10;1.2.3.0/24">${escapeHtml(allowlist.join("\n"))}</textarea></label><button class="primary-button" type="submit">保存白名单</button></form></article>`;
-  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>两步验证与 IP 白名单</title><style>${ADMIN_CSS}</style><body>${topbarHtml("两步验证与 IP 白名单", `<a class="text-link inverse" href="/">返回首页</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("ACCOUNT SECURITY", "两步验证与 IP 白名单", "两步验证与来源 IP 限制同时作用于管理后台登录与 WebDAV 客户端访问。")}<section class="content-grid">${totpCard}${allowlistCard}</section></main></body></html>`);
+  const recoveryCard = extra.recoveryCodes?.length ? `<article class="config-card"><div class="card-heading"><div><p class="eyebrow">RECOVERY CODES</p><h2>恢复码</h2></div><span class="icon-badge">${extra.recoveryCodes.length}</span></div><p class="muted">验证器不可用时，可在登录页的两步验证码输入框中输入任一恢复码登录。每个恢复码仅可使用一次，且<strong>仅本次显示</strong>，请立即保存到安全的地方。</p><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;font-size:16px;letter-spacing:1px">${extra.recoveryCodes.map((code) => `<code>${escapeHtml(code)}</code>`).join("")}</div></article>` : "";
+  return htmlResponse(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>两步验 证与 IP 白名单</title><style>${ADMIN_CSS}</style><body>${topbarHtml("两步验证与 IP 白名单", `<a class="text-link inverse" href="/">返回首页</a><a class="text-link inverse" href="/?action=logout">退出登录</a>`)}<main class="dashboard">${pageHeadingHtml("ACCOUNT SECURITY", "两步验证与 IP 白名单", "两步验证与来源 IP 限制 同时作用于管理后台登录与 WebDAV 客户端访问。")}<section class="content-grid">${totpCard}${allowlistCard}${recoveryCard}</section></main></body></html>`);
 }
 
 function adminRegisterPage(env: Env, error = ""): Response {
