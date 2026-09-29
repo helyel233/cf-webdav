@@ -24,7 +24,8 @@ bucket_name = "cf-webdav-files-helyel2332"
 [vars]
 # 留空表示根路径；如需添加固定前缀，可设置为 "team-files"
 DAV_PREFIX = ""
-# true 时启用访问日志，可在后台查看
+# true 时启用访问日志，可在后台查看；只记录修改类请求（上传/删除/移动等）与失败请求，
+# 成功的只读请求（下载/目录浏览）不记录，以节省 KV 写入配额（免费版每日仅 1000 次）
 ENABLE_ACCESS_LOG = "true"
 # 设为 "false" 可关闭公开注册，仅超级管理员可在后台创建用户（默认开启）
 # ENABLE_PUBLIC_REGISTRATION = "false"

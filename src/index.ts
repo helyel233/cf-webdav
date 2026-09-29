@@ -81,6 +81,9 @@ const LOCK_PREFIX = "davlock:";
 const SHARE_PREFIX = "share:";
 // 每用户每日访问日志写入上限（防异常客户端撑爆日志 KV）；文本预览大小上限
 const MAX_DAILY_LOGS_PER_USER = 2000;
+// 只读方法集合：成功（状态码 <400）的只读请求不写访问日志——每条日志 2 次 KV 写入，
+// 免费版每日写入配额仅 1000 次，下载/目录浏览等高频只读操作是配额大头；失败请求仍完整记录
+const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT", "SEARCH"]);
 const PREVIEW_TEXT_LIMIT = 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"]);
 const TEXT_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "xml", "csv", "log", "yaml", "yml", "ini", "js", "css", "html", "htm", "py", "sh", "ts", "toml"]);
@@ -364,6 +367,8 @@ export default {
 // 新增：记录访问日志；键以倒序毫秒时间戳开头，KV list 字典序升序即最新在前
 async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }): Promise<void> {
   if (env.ENABLE_ACCESS_LOG !== "true") return;
+  // 只读请求成功时跳过记录；修改类请求与 4xx/5xx 失败请求不受影响
+  if (READ_ONLY_METHODS.has(log.method) && log.status < 400) return;
   // IP 脱敏（LOG_IP_REDACT）与保留天数（LOG_RETENTION_DAYS）均为合规可配置项
   const retentionDays = getLogRetentionDays(env);
   const accessLog: AccessLog = {
@@ -388,7 +393,9 @@ async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timesta
   const logKey = `${LOG_PREFIX}${String(1e13 - Date.now()).padStart(13, "0")}-${Math.random().toString(36).slice(2)}`;
   try {
     await env.WEBDAV_KV.put(logKey, JSON.stringify(accessLog), { expirationTtl: retentionDays * 24 * 60 * 60 });
-    await env.WEBDAV_KV.put(dailyKey, String(writtenToday + 1), { expirationTtl: 172800 });
+    // 每日上限计数器按约 1/10 概率批量 +10 回写，省 90% 计数器写入；
+    // 上限仅作防滥用安全阀，允许 ±少量计数误差
+    if (Math.random() < 0.1) await env.WEBDAV_KV.put(dailyKey, String(writtenToday + 10), { expirationTtl: 172800 });
   } catch (error) {
     // 日志写入失败不应影响主请求的响应
     console.error("Failed to write access log", error);
@@ -1596,8 +1603,13 @@ async function sessionUser(request: Request, env: Env): Promise<string | null> {
       await env.WEBDAV_KV.delete(`${SESSION_PREFIX}${token}`);
       return null;
     }
-    // 刷新活跃时间（1 分钟节流，避免每次页面请求都写 KV）；KV TTL 设为剩余秒数，不延长绝对过期
-    if (Date.now() - session.lastSeen > 60_000) {
+    // 刷新活跃时间（节流写 KV，默认 30 分钟一次以省 KV 写入配额）；KV TTL 设为剩余秒数，不延长绝对过期。
+    // 例外一：超管强制空闲超时依赖页面心跳（60 秒）刷新 lastSeen 判活，保持 1 分钟粒度，否则页面开着也会被吊销；
+    // 例外二：配置了较短空闲超时的普通用户按超时窗口一半节流（lastSeen 最旧只滞后半个窗口），避免持续活跃却被误判空闲
+    const refreshMs = session.role === "admin" && getAdminIdleSeconds(env) > 0
+      ? 60_000
+      : idleSeconds > 0 ? Math.min(1_800_000, idleSeconds * 500) : 1_800_000;
+    if (Date.now() - session.lastSeen > refreshMs) {
       const remainSeconds = session.exp ? Math.max(60, Math.ceil((session.exp - Date.now()) / 1000)) : SESSION_TTL;
       await env.WEBDAV_KV.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ user: session.user, lastSeen: Date.now(), exp: session.exp }), { expirationTtl: remainSeconds });
     }
@@ -3232,11 +3244,16 @@ const DEFAULT_RATE_LIMIT: RateLimitConfig = {
 };
 
 const RATE_LIMIT_PREFIX = "ratelimit:";
+// 修改类方法集合：限流计数器是每请求 1-2 次 KV 写入，免费版每日写入配额仅 1000 次，
+// 只对会改动数据的请求计数；读取类请求不做持久化限流
+const MUTATING_METHODS = new Set(["PUT", "DELETE", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH", "POST"]);
 
 // 新增：检查流量限制
 async function checkRateLimit(env: Env, clientIp: string, method: string, contentLength: number): Promise<{ allowed: boolean; retryAfter?: number }> {
   // 默认限制，后续可扩展为从 KV 读取配置
   const config = DEFAULT_RATE_LIMIT;
+  // 读取类请求（GET/HEAD/PROPFIND 等）不写计数器，直接放行
+  if (!MUTATING_METHODS.has(method)) return { allowed: true };
   const now = Date.now();
   const minuteKey = `${RATE_LIMIT_PREFIX}${clientIp}:minute:${Math.floor(now / 60000)}`;
   const hourKey = `${RATE_LIMIT_PREFIX}${clientIp}:hour:${Math.floor(now / 3600000)}`;
