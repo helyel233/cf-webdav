@@ -8,8 +8,8 @@ ADMIN_PASSWORD=change-this-local-password
 # 可选：路径前缀
 # DAV_PREFIX=team-files
 
-# 访问日志开关（true 时记录上传/删除/移动/分享等修改操作与失败请求，可在后台查看；
-# 成功的只读请求不记录，以节省 KV 写入配额）
+# 访问日志开关（true 时记录失败请求（4xx/5xx）与分享操作，可在后台查看；
+# 成功的普通请求不记录，以节省 KV 写入配额）
 ENABLE_ACCESS_LOG=true
 
 # 可选：日志保留天数（默认 30，1-365）与 IP 脱敏

@@ -1,6 +1,8 @@
 interface Env {
   WEBDAV_BUCKET: R2Bucket;
   WEBDAV_KV: KVNamespace;
+  // 官方 Rate Limiting binding：限流计数不占 KV 配额（见 wrangler.toml [[ratelimits]]）
+  RATE_LIMITER: RateLimit;
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
   WEBDAV_USERNAME?: string;
@@ -63,6 +65,7 @@ const AUDIT_RETENTION_DAYS = 365;
 // 新增：RFC 6578 sync-collection 变更状态（每账户作用域一份；KV 读改写非原子，仅作增量同步参考）
 interface SyncState {
   seq: number;
+  activated?: boolean;
   changes: Record<string, { seq: number; kind: "modified" | "deleted" }>;
 }
 const SYNC_STATE_KEY = "sync:state";
@@ -81,9 +84,6 @@ const LOCK_PREFIX = "davlock:";
 const SHARE_PREFIX = "share:";
 // 每用户每日访问日志写入上限（防异常客户端撑爆日志 KV）；文本预览大小上限
 const MAX_DAILY_LOGS_PER_USER = 2000;
-// 只读方法集合：成功（状态码 <400）的只读请求不写访问日志——每条日志 2 次 KV 写入，
-// 免费版每日写入配额仅 1000 次，下载/目录浏览等高频只读操作是配额大头；失败请求仍完整记录
-const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT", "SEARCH"]);
 const PREVIEW_TEXT_LIMIT = 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"]);
 const TEXT_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "xml", "csv", "log", "yaml", "yml", "ini", "js", "css", "html", "htm", "py", "sh", "ts", "toml"]);
@@ -368,8 +368,8 @@ export default {
 // 新增：记录访问日志；键以倒序毫秒时间戳开头，KV list 字典序升序即最新在前
 async function logAccess(env: Env, log: Omit<AccessLog, "timestamp"> & { timestamp?: string }): Promise<void> {
   if (env.ENABLE_ACCESS_LOG !== "true") return;
-  // 只读请求成功时跳过记录；修改类请求与 4xx/5xx 失败请求不受影响
-  if (READ_ONLY_METHODS.has(log.method) && log.status < 400) return;
+  // 只记录失败请求（4xx/5xx）与分享（SHARE）操作；成功的普通操作不再记录，以省 KV 写入配额
+  if (log.status < 400 && log.method !== "SHARE") return;
   // IP 脱敏（LOG_IP_REDACT）与保留天数（LOG_RETENTION_DAYS）均为合规可配置项
   const retentionDays = getLogRetentionDays(env);
   const accessLog: AccessLog = {
@@ -458,6 +458,8 @@ async function recordSyncChange(env: Env, path: string, kind: "modified" | "dele
   if (!path) return;
   try {
     const state = await readSyncState(env);
+    // 懒激活：默认不记录变更；仅当出现过 sync-token REPORT 客户端（见 reportMethod）后才开始写，省 KV 写入
+    if (!state.activated) return;
     state.seq += 1;
     state.changes = { ...state.changes, [path]: { seq: state.seq, kind } };
     const keys = Object.keys(state.changes);
@@ -1662,7 +1664,6 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       const existingObject = await scopedEnv.WEBDAV_BUCKET.head(path);
       await scopedEnv.WEBDAV_BUCKET.put(path, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
       await scopedEnv.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: file.size, contentType: file.type || "application/octet-stream", updatedAt: new Date().toISOString() }));
-      await adjustAccountStorageUsage(scopedEnv, file.size - (existingObject?.size ?? 0));
     } else if (action === "mkdir") {
       const name = String(form.get("name") || "");
       operationPath = adminPath(`${currentPath ? `${currentPath}/` : ""}${name}`);
@@ -1758,7 +1759,6 @@ async function adminFilesAction(request: Request, env: Env, form: FormData, user
       await scopedEnv.WEBDAV_BUCKET.put(r2Key(copyPath), copyContent.body, { httpMetadata: copyContent.httpMetadata });
       const copyMeta = await scopedEnv.WEBDAV_KV.get(metaKey(sourcePath));
       if (copyMeta) await scopedEnv.WEBDAV_KV.put(metaKey(copyPath), copyMeta);
-      await adjustAccountStorageUsage(scopedEnv, copyContent.size);
       await logAccess(env, { method: "COPY", path: copyPath, status: 201, clientIp: request.headers.get("CF-Connecting-IP") || "unknown", userAgent: request.headers.get("User-Agent") || "", user: username });
       return filesPageRedirect(accountUsername, currentPath, "&copied=1");
     }
@@ -1791,7 +1791,6 @@ async function adminUploadStream(request: Request, env: Env, account: WebdavAcco
   const contentType = request.headers.get("Content-Type") || "application/octet-stream";
   await scopedEnv.WEBDAV_BUCKET.put(r2Key(path), request.body, { httpMetadata: { contentType } });
   await scopedEnv.WEBDAV_KV.put(metaKey(path), JSON.stringify({ type: "file", size: contentLength, contentType, updatedAt: new Date().toISOString() }));
-  await adjustAccountStorageUsage(scopedEnv, contentLength - (existingObject?.size ?? 0));
   await logAccess(env, { method: "PUT", path, status: 201, clientIp, userAgent, user: account.owner });
   return textResponse("OK", 201);
 }
@@ -2562,7 +2561,6 @@ async function putObject(request: Request, env: Env, path: string, account: Webd
   const object = await env.WEBDAV_BUCKET.put(r2Key(path), request.body, { httpMetadata: { contentType } });
   const metadata: FileMeta = { type: "file", size: object.size, etag: object.httpEtag, contentType, updatedAt: new Date().toISOString() };
   await env.WEBDAV_KV.put(metaKey(path), JSON.stringify(metadata));
-  await adjustAccountStorageUsage(env, object.size - (existingObject?.size ?? 0));
   await recordSyncChange(env, path, "modified");
   return new Response(null, { status: 201, headers: { ETag: object.httpEtag } });
 }
@@ -2618,7 +2616,6 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     await env.WEBDAV_BUCKET.delete(r2Key(path));
     await env.WEBDAV_KV.delete(metaKey(path));
     await env.WEBDAV_KV.delete(propKey(path));
-    await adjustAccountStorageUsage(env, -object.size);
     await recordSyncChange(env, path, "deleted");
 
     // 记录删除信息到 KV（用于管理界面显示，30 天过期）
@@ -2667,7 +2664,6 @@ async function deletePath(env: Env, path: string, request?: Request): Promise<Re
     isDirectory: true,
     fileCount: objects.length,
   }), { expirationTtl: TRASH_RETENTION_DAYS * 24 * 60 * 60 });
-  await adjustAccountStorageUsage(env, -removedBytes);
   // sync-collection：目录自身与全部子成员记为已删除（子成员仅记录前 100 条，避免大量 KV 写入）
   await recordSyncChange(env, path, "deleted");
   for (const item of objects.slice(0, 100)) await recordSyncChange(env, item.key, "deleted");
@@ -2756,7 +2752,6 @@ async function restoreFromTrash(env: Env, trashKey: string, account?: WebdavAcco
   if (conflicts && !restoredBytes) return textResponse("恢复冲突：目标路径已存在同名文件，已跳过", 409);
 
   // 回收站对象不计入用量，恢复后重新计入
-  if (restoredBytes) await adjustAccountStorageUsage(env, restoredBytes);
   await ensureDirectoryMarkers(env, restoredEntries);
 
   // 部分冲突时保留回收站条目，剩余对象可重试恢复
@@ -2828,7 +2823,6 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
       await env.WEBDAV_KV.delete(metaKey(source));
     }
     // 覆盖写入目标：copy 净增源大小减去被覆盖目标；move 时源随后被移除，净减被覆盖目标
-    await adjustAccountStorageUsage(env, move ? -(destinationObject?.size ?? 0) : sourceObject.size - (destinationObject?.size ?? 0));
     if (move) await recordSyncChange(env, source, "deleted");
     await recordSyncChange(env, destination, "modified");
     return new Response(null, { status: 201 });
@@ -2854,7 +2848,6 @@ async function copyOrMove(request: Request, env: Env, source: string, move: bool
   }
   if (move) await deletePath(env, source);
   // 目录复制净增源目录字节数；move 时下方 deletePath 已扣除源目录，两者相抵
-  await adjustAccountStorageUsage(env, sourceDirBytes);
   await env.WEBDAV_KV.put(dirKey(destination), new Date().toISOString());
   await recordSyncChange(env, destination, "modified");
   return new Response(null, { status: 201 });
@@ -3043,6 +3036,11 @@ async function reportMethod(request: Request, env: Env, path: string, account?: 
   const tokenNumber = Number(rawToken.split("/").pop());
   const token = Number.isFinite(tokenNumber) ? tokenNumber : 0;
   const state = await readSyncState(env);
+  // 懒激活：首次收到 sync-token REPORT 即开始记录后续变更（一次性 1 次 KV 写入）
+  if (!state.activated) {
+    state.activated = true;
+    try { await env.WEBDAV_KV.put(SYNC_STATE_KEY, JSON.stringify(state)); } catch { }
+  }
   const changed = Object.entries(state.changes).filter(([, change]) => change.seq > token).sort((a, b) => a[1].seq - b[1].seq);
   const limit = 500;
   const truncated = changed.length > limit;
@@ -3148,21 +3146,17 @@ async function storageSizeAtPath(env: Env, path: string): Promise<number> {
 
 const STORAGE_USAGE_KEY = "storage-usage";
 
-// 读取账户存储用量 KV 缓存（不含 __trash/ 回收站对象）；缓存缺失时全量扫描 R2 重建
+// 用量缓存有效期：过期后才全量扫描 R2 重建（每操作增量更新已移除以省 KV 写入，精度以小时为界）
+const STORAGE_USAGE_TTL_MS = 60 * 60 * 1000;
+
+// 读取账户存储用量 KV 缓存（不含 __trash/ 回收站对象）；缓存缺失或过期时全量扫描 R2 重建
 async function getAccountStorageUsage(env: Env): Promise<number> {
-  const cached = await env.WEBDAV_KV.get(STORAGE_USAGE_KEY, "json") as { bytes: number } | null;
-  if (cached && Number.isFinite(cached.bytes)) return cached.bytes;
+  const cached = await env.WEBDAV_KV.get(STORAGE_USAGE_KEY, "json") as { bytes: number; updatedAt?: string } | null;
+  if (cached && Number.isFinite(cached.bytes) && cached.updatedAt && Date.now() - new Date(cached.updatedAt).getTime() < STORAGE_USAGE_TTL_MS) return cached.bytes;
   const objects = await listAllObjects(env, "");
   const bytes = objects.filter((item) => !item.key.startsWith("__trash/")).reduce((total, item) => total + item.size, 0);
   await env.WEBDAV_KV.put(STORAGE_USAGE_KEY, JSON.stringify({ bytes, updatedAt: new Date().toISOString() }));
   return bytes;
-}
-
-// 写操作后增量更新账户存储用量缓存；KV 读改写非原子，极端并发下可能有少量漂移
-async function adjustAccountStorageUsage(env: Env, delta: number): Promise<void> {
-  if (!delta) return;
-  const current = await getAccountStorageUsage(env);
-  await env.WEBDAV_KV.put(STORAGE_USAGE_KEY, JSON.stringify({ bytes: Math.max(0, current + delta), updatedAt: new Date().toISOString() }));
 }
 
 async function getUserStorageUsage(env: Env, owner: string): Promise<number> {
@@ -3245,41 +3239,22 @@ const DEFAULT_RATE_LIMIT: RateLimitConfig = {
 };
 
 const RATE_LIMIT_PREFIX = "ratelimit:";
-// 修改类方法集合：限流计数器是每请求 1-2 次 KV 写入，免费版每日写入配额仅 1000 次，
-// 只对会改动数据的请求计数；读取类请求不做持久化限流
-const MUTATING_METHODS = new Set(["PUT", "DELETE", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH", "POST"]);
 
 // 新增：检查流量限制
 async function checkRateLimit(env: Env, clientIp: string, method: string, contentLength: number): Promise<{ allowed: boolean; retryAfter?: number }> {
-  // 默认限制，后续可扩展为从 KV 读取配置
-  const config = DEFAULT_RATE_LIMIT;
-  // 读取类请求（GET/HEAD/PROPFIND 等）不写计数器，直接放行
-  if (!MUTATING_METHODS.has(method)) return { allowed: true };
+  // 每分钟请求数：官方 Rate Limiting binding（不占 KV 配额，也无 KV 读改写非原子问题）；读取与修改请求都限流
+  const minute = await env.RATE_LIMITER.limit({ key: clientIp });
+  if (!minute.success) return { allowed: false, retryAfter: 60 };
+
+  // 每小时上传流量（仅 PUT）：需累计字节数，binding 无法表达，保留 KV 计数（每次 PUT 1 写）
+  if (method !== "PUT") return { allowed: true };
   const now = Date.now();
-  const minuteKey = `${RATE_LIMIT_PREFIX}${clientIp}:minute:${Math.floor(now / 60000)}`;
   const hourKey = `${RATE_LIMIT_PREFIX}${clientIp}:hour:${Math.floor(now / 3600000)}`;
-
-  // 检查每分钟请求数
-  const minuteCount = parseInt(await env.WEBDAV_KV.get(minuteKey) || "0");
-  if (minuteCount >= config.maxRequestsPerMinute) {
-    return { allowed: false, retryAfter: 60 - (Math.floor(now / 1000) % 60) };
+  const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
+  if (hourBytes + contentLength > DEFAULT_RATE_LIMIT.maxUploadBytesPerHour) {
+    return { allowed: false, retryAfter: 3600 - (Math.floor(now / 1000) % 3600) };
   }
-
-  // 检查每小时上传流量（仅对 PUT 请求）
-  if (method === "PUT") {
-    const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
-    if (hourBytes + contentLength > config.maxUploadBytesPerHour) {
-      return { allowed: false, retryAfter: 3600 - (Math.floor(now / 1000) % 3600) };
-    }
-  }
-
-  // 更新计数
-  await env.WEBDAV_KV.put(minuteKey, String(minuteCount + 1), { expirationTtl: 120 });
-  if (method === "PUT") {
-    const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
-    await env.WEBDAV_KV.put(hourKey, String(hourBytes + contentLength), { expirationTtl: 3700 });
-  }
-
+  await env.WEBDAV_KV.put(hourKey, String(hourBytes + contentLength), { expirationTtl: 3700 });
   return { allowed: true };
 }
 

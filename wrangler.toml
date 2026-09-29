@@ -21,11 +21,21 @@ binding = "WEBDAV_BUCKET"
 # 该名称需全局唯一；如果已被占用，请替换为带随机后缀的名称，例如 cf-webdav-files-xyz789
 bucket_name = "cf-webdav-files-helyel2332"
 
+# 官方 Rate Limiting binding：限流计数走 Cloudflare 基础设施，不占 Workers KV 每日写入配额。
+# 60 次 / 60 秒：与代码中每分钟请求数限制一致；namespace_id 需在账户内唯一
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
 [vars]
 # 留空表示根路径；如需添加固定前缀，可设置为 "team-files"
 DAV_PREFIX = ""
-# true 时启用访问日志，可在后台查看；只记录修改类请求（上传/删除/移动等）与失败请求，
-# 成功的只读请求（下载/目录浏览）不记录，以节省 KV 写入配额（免费版每日仅 1000 次）
+# true 时启用访问日志，可在后台查看；只记录失败请求（4xx/5xx）与分享操作，
+# 成功的普通请求（下载/上传/删除等）不记录，以节省 KV 写入配额（免费版每日仅 1000 次）
 ENABLE_ACCESS_LOG = "true"
 # 设为 "false" 可关闭公开注册，仅超级管理员可在后台创建用户（默认开启）
 # ENABLE_PUBLIC_REGISTRATION = "false"
