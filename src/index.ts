@@ -3246,15 +3246,18 @@ async function checkRateLimit(env: Env, clientIp: string, method: string, conten
   const minute = await env.RATE_LIMITER.limit({ key: clientIp });
   if (!minute.success) return { allowed: false, retryAfter: 60 };
 
-  // 每小时上传流量（仅 PUT）：需累计字节数，binding 无法表达，保留 KV 计数（每次 PUT 1 写）
+  // 每小时上传流量（仅 PUT）：需累计字节数，binding 无法表达，保留 KV 计数
   if (method !== "PUT") return { allowed: true };
   const now = Date.now();
   const hourKey = `${RATE_LIMIT_PREFIX}${clientIp}:hour:${Math.floor(now / 3600000)}`;
   const hourBytes = parseInt(await env.WEBDAV_KV.get(hourKey) || "0");
+  // 超限即拒绝：与日志计数器一样不写入，省一次 KV 写
   if (hourBytes + contentLength > DEFAULT_RATE_LIMIT.maxUploadBytesPerHour) {
     return { allowed: false, retryAfter: 3600 - (Math.floor(now / 1000) % 3600) };
   }
-  await env.WEBDAV_KV.put(hourKey, String(hourBytes + contentLength), { expirationTtl: 3700 });
+  // 按约 1/10 概率批量回写 +10×contentLength，省 90% 计数器写入；
+  // 上限仅作防滥用安全阀，允许 ±少量字节计数误差（实际累计可能比真实少 0~9 倍单条大小）
+  if (Math.random() < 0.1) await env.WEBDAV_KV.put(hourKey, String(hourBytes + contentLength * 10), { expirationTtl: 3700 });
   return { allowed: true };
 }
 
